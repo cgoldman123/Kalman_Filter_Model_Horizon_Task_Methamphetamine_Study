@@ -1,0 +1,9 @@
+onset	duration	trial_type	trial_number	event_code	response_time	response	result
+0.0	0	n/a	n/a	0	n/a	n/a	n/a
+92.0143436	n/a	n/a	fear	1	5.986402600072324	3	How much fear did you feel while breathing?
+97.6481989	n/a	n/a	difficult	1	5.52117560012266	3	How difficult did it feel to breath?
+102.4629775	n/a	n/a	unpleasant	1	4.709202399943024	2	How unpleasant did it feel to breathe?
+108.8798484	n/a	n/a	happy	1	6.3576502001378685	2	How happy or unhappy did you feel during loaded breathing?
+113.7971769	n/a	n/a	calm	1	4.841642600018531	1	How calm or excited did you feel during loaded breathing?
+120.1617776	n/a	n/a	anxiety	1	6.2473771998193115	2	Please indicate how much anxiety you felt while breathing.
+120.1736902	n/a	n/a	n/a	99	n/a	n/a	n/a
