@@ -1,0 +1,1695 @@
+---
+title: "horizon_iMUD_code"
+output: html_document
+date: "2024-12-15"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r load libraries and read in data}
+# Clear environment variables
+rm(list = ls())
+
+# devtools::install_github("jorvlan/raincloudplots")
+library(raincloudplots)
+library(gghalves)
+library(tidyverse)  # Keep script tidy
+library(brms)
+library(jtools)
+library(effectsize)
+library(lme4)
+library(car)
+library(emmeans)
+library(magrittr)
+library(outliers)
+library(mediation)
+library(dplyr)
+
+select <- dplyr::select
+filter =  dplyr::filter
+mutate =  dplyr::mutate
+
+source('L:/rsmith/smt-lib/corrplotplus.R') # optional function for pretty correlation plot
+source('L:/rsmith/lab-members/cgoldman/general/corrplotplus_CMG.R') # optional function for pretty correlation plot
+
+
+
+
+# Change this file path to where you've saved the data file
+df = read.csv("C:/Users/CGoldman/OneDrive - Laureate Institute for Brain Research/Desktop/Horizon iMUD Manuscripts/Nature Communications Psychology/first_revision_data_and_code/horizon_iMUD_data.csv")
+
+
+## create cluster for starting learning rate
+ids <- df %>%
+  filter(run=='run-1') %>% dplyr::select(id)
+  
+clus <- df %>%
+  pull(alpha.start) %>%
+  kmeans(., center=2) %$% cluster %>%
+  as.data.frame %>% rename(alpha_cluster='.') %>%
+  mutate(alpha_cluster=abs(alpha_cluster-2))%>%
+  cbind(ids, .)
+
+# switch 1 and 0 cluster label if cluster 1 is less than cluster 0
+cluster_one_mean = mean(df[clus$alpha_cluster ==1, ]$alpha.start)
+cluster_zero_mean = mean(df[clus$alpha_cluster ==0, ]$alpha.start)
+if (cluster_one_mean < cluster_zero_mean) {
+  clus$alpha_cluster = 1 - clus$alpha_cluster
+}
+df$alpha.start.cluster = as.factor(clus$alpha_cluster)
+
+
+
+## create directed exploration and random exploration
+df$info.bonus.h6.h1.diff = df$info.bonus.h6 - df$info.bonus.h1
+df$dec.noise.h6.h1.22.diff = df$dec.noise.h6.22 - df$dec.noise.h1.22
+
+
+
+## sum-code variables
+df$group = factor(df$group)
+contrasts(df$group) <- matrix(c(-1, 1), ncol = 1)
+df$task.resistance = factor(df$task.resistance)
+contrasts(df$task.resistance) <- matrix(c(-1, 1), ncol = 1)
+df$old.horizon.version = factor(df$old.horizon.version)
+contrasts(df$old.horizon.version) <- matrix(c(-1, 1), ncol = 1)
+df$sex = factor(df$sex)
+contrasts(df$sex) <- matrix(c(1, -1), ncol = 1)
+df$age.centered = gscale(df$age, center.only = T)
+df$list.sort.fully.corrected.t.score.centered = gscale(df$list.sort.fully.corrected.t.score, center.only = T)
+df$alpha.start.centered = gscale(df$alpha.start, center.only = T)
+
+
+# dict = read_excel("C:/Users/CGoldman/OneDrive - Laureate Institute for Brain Research/Desktop/Horizon iMUD Manuscripts/Nature Communications Psychology/horizon_iMUD_data_dictionary.xlsx")
+
+
+
+
+```
+```{r LME/LM function to get table for categorical predictors (including post hoc contrasts) }
+
+summarize_and_refine_model_lme <- function(models) {
+  summarize_model <- function(model) {
+    tidy_summary <- broom.mixed::tidy(model, conf.int = TRUE, conf.level = 0.95)
+    model_name <- deparse(formula(model), width.cutoff = 500)
+    
+    
+    # do a different type of statistical test for categorical outcome variable (e.g., binomial)
+    if (str_detect(model_name, "alpha.start.cluster ~")) {
+      anova = Anova(model)
+      anova$Df.res = NA
+      anova$`F` = NA
+      anova$`Pr(>F)` = NA
+      tidy_summary <- tidy_summary[1:(nrow(tidy_summary) - 1), ]
+      tidy_summary$df = NA
+    } else {
+      anova = Anova(model, test = "F")
+      anova$`Pr(>Chisq)` = NA
+      anova$Chisq = NA
+      tidy_summary <- tidy_summary[1:(nrow(tidy_summary) - 2), ]
+    }
+    
+    empty_df <- data.frame(matrix(NA, ncol = ncol(anova), nrow = nrow(tidy_summary)))
+    colnames(empty_df) <- colnames(anova)
+    empty_df$term_simple = NA
+    
+    for (i in seq_len(nrow(anova))) {
+      term <- rownames(anova)[i]
+      if (str_detect(term, ":")) {
+        parts <- str_split(term, ":", simplify = TRUE)
+        matched_rows <- which(str_detect(tidy_summary$term, parts[1]) & str_detect(tidy_summary$term, parts[2]))
+      } else {
+        matched_rows <- which(str_detect(tidy_summary$term, term))
+      }
+      
+      empty_df[matched_rows, ] <- anova[i, ]
+      empty_df$term_simple[matched_rows] <- term
+    }
+    
+    tidy_summary <- cbind(tidy_summary, empty_df)
+    tidy_summary$model_name <- rep(model_name, nrow(tidy_summary))
+    tidy_summary <- tidy_summary %>% 
+      mutate(partial_eta_squared = if_else(is.na(`F`) | is.na(Df) | is.na(`Df.res`), NA_real_, 
+                                           F_to_eta2(f = `F`, df = Df, df_error = `Df.res`)$Eta2_partial))
+    
+    return(tidy_summary)
+  }
+  
+  refine_model <- function(model_summaries) {
+    prepared_summaries <- model_summaries %>%
+      mutate(
+        Estimate = round(estimate, 3),
+        `CI` = sprintf("[%.3f, %.3f]", `conf.low`, `conf.high`),
+        `b_CI` = ifelse(is.na(Estimate), NA, sprintf("%.3f %s", Estimate, `CI`)),
+        `Pr(>F)` = ifelse(`Pr(>F)` < 0.001, "<.001", sub("^0+", "", sprintf("%.3f", `Pr(>F)`))),
+        Statistical_Test = ifelse(is.na(`F`), NA, sprintf("F(%.0f,%.1f)=%.2f", `Df`, `Df.res`, `F`)),
+        partial_eta_squared = ifelse(partial_eta_squared < 0.01, "<.01", sub("^0+", "", sprintf("%.2f", partial_eta_squared))),
+        `Pr(>Chisq)` = ifelse(`Pr(>Chisq)` < 0.001, "<.001", sprintf("%.3f", `Pr(>Chisq)`)),
+      `Chisq_Test` = ifelse(is.na(`Chisq`), NA, sprintf("Chisq(%.0f)=%.2f", `Df`, `Chisq`))
+      ) %>%
+      dplyr::select(
+        model_name, term, term_simple, Statistical_Test, `Pr(>F)`, Chisq_Test, `Pr(>Chisq)`,partial_eta_squared, b_CI
+      ) %>%
+      dplyr::filter(term != "(Intercept)")
+    
+    # Collapse rows by term_simple
+    collapsed_summaries <- prepared_summaries %>%
+      group_by(model_name, term_simple, Statistical_Test, `Pr(>F)`, Chisq_Test,`Pr(>Chisq)`, partial_eta_squared) %>%
+      dplyr::summarize(
+      `b_CI` = if(n() == 1) first(`b_CI`) else paste0(term, ": ", `b_CI`, collapse = ", "),
+      .groups = 'drop'
+      ) %>%
+      ungroup()
+    
+    return(collapsed_summaries)
+  }
+  
+  get_emmeans_strings <- function(model) {
+    predictors <- attr(terms(model), "term.labels")
+    emmeans_strings <- sapply(predictors, function(predictor) {
+      emmeans_results <- emmeans(model, as.formula(paste("~", predictor))) %>%
+        as.data.frame()
+      name_cols <- names(emmeans_results)[1:(grep("emmean", names(emmeans_results)) - 1)]
+      combined_names <- if (length(name_cols) == 1 && is.numeric(emmeans_results[[name_cols]])) {
+        paste(name_cols)
+      } else {
+        apply(emmeans_results[, name_cols, drop = FALSE], 1, paste, collapse = " x ")
+      }
+      paste(combined_names, sprintf("%.2f", emmeans_results$emmean), sep = "=", collapse = ",")
+
+    })
+    as.data.frame(emmeans_strings, stringsAsFactors = FALSE) %>% rownames_to_column(var = "term")
+  }
+  
+
+get_emtrends_strings <- function(model) {
+  predictors <- attr(terms(model), "term.labels")
+  emtrends_strings <- sapply(predictors, function(term) {
+    components <- strsplit(term, ":")[[1]]
+    if (length(components) == 2) { 
+      model_data <- model@frame
+      first_term_in_interaction <- model_data[, components[1], drop = FALSE]
+      second_term_in_interaction <- model_data[, components[2], drop = FALSE]
+      if (is.numeric(first_term_in_interaction[,1]) && !is.numeric(second_term_in_interaction[,1])) {
+        emtrends_results <- emtrends(model, as.formula(paste0("pairwise ~ ", components[2])), var = components[1])$emtrends %>% as.data.frame()
+        trend_string <- paste(paste0(components[1], "_at_", emtrends_results[[1]]), sprintf("%.3f", emtrends_results$trend), sep = " = ", collapse = ", ")
+        return(trend_string)
+      } else if (!is.numeric(first_term_in_interaction[,1]) && is.numeric(second_term_in_interaction[,1])) {
+        emtrends_results <- emtrends(model, as.formula(paste0("pairwise ~ ", components[1])), var = components[2])$emtrends %>% as.data.frame()
+        trend_string <- paste(paste0(components[2], " x ", emtrends_results[[1]]), sprintf("%.3f", emtrends_results[,2]), sep = " = ", collapse = ", ")
+        return(trend_string)
+      } else {
+        return(NA) 
+      }
+    } else {
+      return(NA) 
+    }
+  })
+  as.data.frame(emtrends_strings, stringsAsFactors = FALSE) %>% rownames_to_column(var = "term")
+}
+
+
+  
+  
+  
+  
+  
+  
+  get_posthoc_contrasts_strings <- function(model) {
+    predictors <- attr(terms(model), "term.labels")
+    contrasts_strings <- sapply(predictors, function(predictor) {
+      contrast_results <- emmeans(model, as.formula(paste("pairwise ~", predictor)), adjust = "none")$contrasts %>%
+        as.data.frame()
+      if (!"t.ratio" %in% names(contrast_results)) {
+        "n/a"
+      } else {
+        contrast_results %>%
+          mutate(
+                estimate = paste0("=",sprintf("%.3f", estimate)),
+                p.value = ifelse(p.value < 0.001, "<.001", paste0("=",sub("^0+", "", sprintf("%.3f", p.value)))),
+                 contrast_stats =  paste0("c",estimate,", ",
+                                          "t(", round(df,1), ")=", sprintf("%.2f", t.ratio),", ",
+                                         "p", p.value),
+                 contrast_string = paste(contrast,contrast_stats, sep=": ")) %>%
+          
+          pull(contrast_string) %>%
+          paste(collapse = ",")
+      }
+    }, simplify = TRUE, USE.NAMES = TRUE)
+    data.frame(contrasts_strings, stringsAsFactors = FALSE) %>% rownames_to_column(var = "term")
+  }
+  
+
+  get_combined_stats <- function(summaries_combined) {
+  summaries_combined <- summaries_combined %>%
+    mutate(
+      stats_combined = paste0(
+        coalesce(Statistical_Test, Chisq_Test),
+        ", p",
+        coalesce(
+          ifelse(str_detect(`Pr(>F)`, "<"), `Pr(>F)`, paste0("=", `Pr(>F)`)),
+          ifelse(str_detect(`Pr(>Chisq)`, "<"), `Pr(>Chisq)`, paste0("=", `Pr(>Chisq)`)),
+          ""
+        ),
+        ", pe_sqd",
+        ifelse(str_detect(partial_eta_squared, "<"), partial_eta_squared, paste0("=", partial_eta_squared)),
+        ", b=", b_CI
+      )
+    )
+  
+  return(summaries_combined)
+}
+  
+  
+  
+  
+  
+  final_results = NULL
+  for (model in models) {
+      # Summarize the model
+      model_summaries <- summarize_model(model)
+      
+      # Refine the model summary
+      refined_summaries <- refine_model(model_summaries)
+      
+      # Get emmeans and contrasts
+      emmeans_results <- get_emmeans_strings(model)
+      contrasts_results <- get_posthoc_contrasts_strings(model)
+      emtrends_results = get_emtrends_strings(model)
+      
+      # Merge the refined summary with emmeans and contrasts
+      summaries_combined <- refined_summaries %>%
+        left_join(emmeans_results, by = c("term_simple" = "term")) %>%
+        left_join(contrasts_results, by = c("term_simple" = "term")) %>%
+        left_join(emtrends_results, by = c("term_simple" = "term")) 
+
+      summaries_combined <- summaries_combined %>%
+        mutate(emmeans_strings = ifelse(!is.na(emtrends_strings), NA, emmeans_strings),
+          contrasts_strings = ifelse(!is.na(emtrends_strings), NA, contrasts_strings))
+      
+      final_summaries_combined = get_combined_stats(summaries_combined)
+
+      # Combine the results with the previous models
+      final_results <- rbind(final_results, final_summaries_combined)
+  }
+  return(final_results)
+}
+
+
+# Example usage:
+# model = lmer(accuracy ~ condition*status + list_sort_fully_corrected_t_score+age+sex+(1|id),gngb_long_acc)
+# models_list <- list(model)
+# model_summaries <- summarize_and_refine_model_lme(models_list)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+summarize_and_refine_model_lm <- function(models) {
+  summarize_model <- function(model) {
+    tidy_summary <- broom.mixed::tidy(model, conf.int = TRUE, conf.level = 0.95)
+    model_name <- deparse(formula(model), width.cutoff = 500)
+    
+    if (str_detect(model_name, "alpha.start.cluster ~")) {
+      anova = Anova(model)
+      anova$Df.res = NA
+      anova$`F` = NA
+      anova$`Pr(>F)` = NA
+      tidy_summary <- tidy_summary[1:(nrow(tidy_summary) - 1), ]
+      tidy_summary$df = NA
+    } else {
+      anova = Anova(model, test="F") 
+      anova$`Pr(>Chisq)` = NA
+      anova$Chisq = NA
+     # tidy_summary <- tidy_summary[1:(nrow(tidy_summary) - 2), ]
+    }
+    anova$partial_eta_squared =  anova$`Sum Sq` / anova["Residuals","Sum Sq"]
+    
+    anova = anova[1:(nrow(anova)-1),] # get rid of residuals column
+  
+ # this sometimes causes problems
+    empty_df <- data.frame(matrix(NA, ncol = ncol(anova), nrow = nrow(tidy_summary)))
+    
+    
+    colnames(empty_df) <- colnames(anova)
+    empty_df$term_simple = NA
+    for (i in seq_len(nrow(anova))) {
+      term <- rownames(anova)[i]
+      if (str_detect(term, ":")) {
+        parts <- str_split(term, ":", simplify = TRUE)
+        matched_rows <- which(str_detect(tidy_summary$term, parts[1]) & str_detect(tidy_summary$term, parts[2]))
+      } else {
+        matched_rows <- which(str_detect(tidy_summary$term, term))
+      }
+      
+      empty_df[matched_rows, ] <- anova[i, ]
+      empty_df$term_simple[matched_rows] <- term
+    }
+    
+    tidy_summary <- cbind(tidy_summary, empty_df)
+    tidy_summary$model_name <- rep(model_name, nrow(tidy_summary))
+    
+    
+    return(tidy_summary)
+  }
+  
+  refine_model <- function(model_summaries) {
+  prepared_summaries <- model_summaries %>%
+    mutate(
+      Estimate = round(estimate, 3),
+      `Pr(>F)` = ifelse(`Pr(>F)` < 0.001, "<.001", as.character(sub("^0+", "", sprintf("%.3f", `Pr(>F)`)))),
+      Statistical_Test = ifelse(is.na(`Chisq`), NA, sprintf("F(%d)=%.2f", `Df`, `Chisq`)),
+      `CI` = sprintf("[%.3f, %.3f]", `conf.low`, `conf.high`),
+      `b_CI` = ifelse(is.na(Estimate), NA, sprintf("%.3f %s", Estimate, `CI`)),
+      `Pr(>Chisq)` = ifelse(`Pr(>Chisq)` < 0.001, "<.001", sprintf("%.3f", `Pr(>Chisq)`)),
+      `Chisq_Test` = ifelse(is.na(`Chisq`), NA, sprintf("Chisq(%.0f)=%.2f", `Df`, `Chisq`)),
+      partial_eta_squared = ifelse(partial_eta_squared < 0.01, "<.01", sub("^0+", "", sprintf("%.2f", partial_eta_squared))),
+    ) %>%
+    dplyr::select(
+      model_name, term, term_simple,Statistical_Test, `Pr(>F)`, Chisq_Test, `Pr(>Chisq)`,partial_eta_squared, `b_CI`
+    ) %>%
+    dplyr::filter(term != "(Intercept)")
+  
+    # Collapse rows by term_simple
+    collapsed_summaries <- prepared_summaries %>%
+      group_by(model_name, term_simple, Statistical_Test, `Pr(>F)`, Chisq_Test, `Pr(>Chisq)`,partial_eta_squared) %>%
+      dplyr::summarize(
+      `b_CI` = if(n() == 1) first(`b_CI`) else paste0(term, ": ", `b_CI`, collapse = ", "),
+      .groups = 'drop'
+    ) %>%
+    ungroup()
+
+  
+
+    return(collapsed_summaries)
+}
+  
+  get_emmeans_strings <- function(model) {
+    predictors <- attr(terms(model), "term.labels")
+    emmeans_strings <- sapply(predictors, function(predictor) {
+      emmeans_results <- emmeans(model, as.formula(paste("~", predictor))) %>%
+        as.data.frame()
+      name_cols <- names(emmeans_results)[1:(grep("emmean", names(emmeans_results)) - 1)]
+      combined_names <- if (length(name_cols) == 1 && is.numeric(emmeans_results[[name_cols]])) {
+        paste(name_cols)
+      } else {
+        apply(emmeans_results[, name_cols, drop = FALSE], 1, paste, collapse = " x ")
+      }
+      paste(combined_names, sprintf("%.2f", emmeans_results$emmean), sep = "=", collapse = ",")
+      #paste(combined_names, "hi", sep = ":", collapse = ",")
+
+    })
+    as.data.frame(emmeans_strings, stringsAsFactors = FALSE) %>% rownames_to_column(var = "term")
+  }
+  
+  get_posthoc_contrasts_strings <- function(model) {
+    predictors <- attr(terms(model), "term.labels")
+    contrasts_strings <- sapply(predictors, function(predictor) {
+      contrast_results <- emmeans(model, as.formula(paste("pairwise ~", predictor)), adjust = "none")$contrasts %>%
+        as.data.frame()
+      if (!"t.ratio" %in% names(contrast_results)) {
+        "n/a"
+      } else {
+        contrast_results %>%
+          mutate(
+                estimate = paste0("=",sprintf("%.3f", estimate)),
+                p.value = ifelse(p.value < 0.001, "<.001", paste0("=",sub("^0+", "", sprintf("%.3f", p.value)))),
+                 contrast_stats =  paste0("c",estimate,", ",
+                                          "t(", round(df,1), ")=", sprintf("%.2f", t.ratio),", ",
+                                         "p", p.value),
+                 contrast_string = paste(contrast,contrast_stats, sep=": ")) %>%
+          
+          pull(contrast_string) %>%
+          paste(collapse = ",")
+      }
+    }, simplify = TRUE, USE.NAMES = TRUE)
+    data.frame(contrasts_strings, stringsAsFactors = FALSE) %>% rownames_to_column(var = "term")
+  }
+  
+  get_emtrends_strings <- function(model) {
+  predictors <- attr(terms(model), "term.labels")
+  emtrends_strings <- sapply(predictors, function(term) {
+    components <- strsplit(term, ":")[[1]]
+    if (length(components) == 2) { 
+      model_data <- model.frame(model)
+      first_term_in_interaction <- model_data[, components[1], drop = FALSE]
+      second_term_in_interaction <- model_data[, components[2], drop = FALSE]
+      if (is.numeric(first_term_in_interaction[,1]) && !is.numeric(second_term_in_interaction[,1])) {
+        emtrends_results <- emtrends(model, as.formula(paste0("pairwise ~ ", components[2])), var = components[1])$emtrends %>% as.data.frame()
+        trend_string <- paste(paste0(components[1], "_at_", emtrends_results[[1]]), sprintf("%.3f", emtrends_results$trend), sep = " = ", collapse = ", ")
+        return(trend_string)
+      } else if (!is.numeric(first_term_in_interaction[,1]) && is.numeric(second_term_in_interaction[,1])) {
+        emtrends_results <- emtrends(model, as.formula(paste0("pairwise ~ ", components[1])), var = components[2])$emtrends %>% as.data.frame()
+        trend_string <- paste(paste0(components[2], " x ", emtrends_results[[1]]), sprintf("%.3f", emtrends_results[,2]), sep = " = ", collapse = ", ")
+        return(trend_string)
+      } else {
+        return(NA) 
+      }
+    } else {
+      return(NA) 
+    }
+  })
+  as.data.frame(emtrends_strings, stringsAsFactors = FALSE) %>% rownames_to_column(var = "term")
+}
+  
+  final_results = NULL
+  for (model in models) {
+      # Summarize the model
+      model_summaries <- summarize_model(model)
+      
+      # Refine the model summary
+      refined_summaries <- refine_model(model_summaries)
+      
+      # Get emmeans and contrasts
+      emmeans_results <- get_emmeans_strings(model)
+      contrasts_results <- get_posthoc_contrasts_strings(model)
+      emtrends_results = get_emtrends_strings(model)
+      
+      # Merge the refined summary with emmeans and contrasts
+      summaries_combined <- refined_summaries %>%
+        left_join(emmeans_results, by = c("term_simple" = "term")) %>%
+        left_join(contrasts_results, by = c("term_simple" = "term")) %>%
+        left_join(emtrends_results, by = c("term_simple" = "term")) 
+
+      summaries_combined <- summaries_combined %>%
+        mutate(emmeans_strings = ifelse(!is.na(emtrends_strings), NA, emmeans_strings),
+          contrasts_strings = ifelse(!is.na(emtrends_strings), NA, contrasts_strings))
+      
+      # Combine the results with the previous models
+      final_results <- rbind(final_results, summaries_combined)
+  }
+  return(final_results)
+}
+
+# EXAMPLE HOW TO CALL FUNCTION
+# models_list = c(model)
+# model_summaries <- do.call(rbind, lapply(models_list, summarize_model))
+# tempo = (refine_model(model_summaries))
+```
+
+
+
+```{r Descriptive Characteristics of HCs and iMUDs.}
+
+questionnaires = c("age", "list.sort.fully.corrected.t.score", "PHQ.score", "STAIt.score","UPPSP.total","CRT.num.correct")
+
+summarize_stats = function(df, questionnaires) {
+  df_summary <- df %>%
+    select(id, group, task.resistance, all_of(questionnaires)) %>%
+    filter(task.resistance == 'Resistance') %>%
+    gather(questionnaire, score, -id, -group, -task.resistance) %>%
+    dplyr::group_by(group, questionnaire) %>%
+    dplyr::summarize(
+      avg = mean(score, na.rm = TRUE),
+      sd = sd(score, na.rm = TRUE),
+      .groups = 'drop'
+    )
+  
+  t_tests <- df %>%
+    select(id, group, task.resistance, all_of(questionnaires)) %>%
+    filter(task.resistance == 'Resistance') %>%
+    gather(questionnaire, score, -id, -group, -task.resistance) %>%
+    dplyr::group_by(questionnaire) %>%
+    do({
+      t_test_result <- t.test(score ~ group, data = ., conf.int = TRUE, conf.level = 0.95)
+      tidy_result <- tidy(t_test_result)
+      c_d <- cohens_d(score ~ group, data = ., pooled = FALSE)
+      # Add degrees of freedom from the t-test result
+      df <- t_test_result$parameter
+      test_result <- cbind(tidy_result, cohens_d = c_d$Cohens_d, df = df)
+      test_result
+    })
+  
+  df_summary_wide <- df_summary %>%
+    pivot_wider(
+      id_cols = questionnaire,
+      names_from = group,
+      values_from = c(avg, sd),
+      names_sep = "_"
+    )
+  
+  summary <- df_summary_wide %>%
+    left_join(t_tests %>% select(questionnaire, estimate, statistic, p.value, conf.low, conf.high, cohens_d, df), by = "questionnaire")
+  
+  summary <- summary[match(questionnaires, summary$questionnaire), ]
+
+  return(summary)
+}
+
+
+df_summary_wide = summarize_stats(df,questionnaires)
+
+final_table <- df_summary_wide %>%
+  mutate(
+    `P_Value` = ifelse(`p.value` < .001, "<.001", sprintf("%.3f", p.value)),
+    `HC` = sprintf("%.2f (%.2f)", avg_HC, sd_HC),
+    `iMUD` = sprintf("%.2f (%.2f)", avg_iMUD, sd_iMUD),
+    `Statistic` = sprintf("t(%.1f)=%.2f", df, statistic),
+    `CI` = sprintf("[%.3f, %.3f]", conf.low, conf.high),
+    `PVal` = P_Value,  # Use formatted `P_Value` from earlier mutation
+    `Cohens_D` = sprintf("%.2f", as.numeric(cohens_d))  # Ensure cohens_d is numeric and formatted
+  ) %>%
+  select(Questionnaire = questionnaire, HC, iMUD, Statistic, CI, PVal, Cohens_D)
+
+
+
+# iMUD variables
+df_iMUD_resistance = df %>% filter(task.resistance=="Resistance") %>% filter(group=="iMUD")
+mean(df_iMUD_resistance$DAST,na.rm=T)
+mean(df_iMUD_resistance$MAWQ.total,na.rm=T)
+mean(df_iMUD_resistance$premock.DSQ,na.rm=T)
+
+sd(df_iMUD_resistance$DAST,na.rm=T)
+sd(df_iMUD_resistance$MAWQ.total,na.rm=T)
+sd(df_iMUD_resistance$premock.DSQ,na.rm=T)
+
+
+
+
+# Sex effects
+df_stripped = df %>% filter(task.resistance == "Resistance")
+df_stripped$Sex_recode <- ifelse(df_stripped$sex == "Female", 1, 0)
+contingency_table <- table(df_stripped$group, df_stripped$Sex_recode)
+chi_sq_result <- chisq.test(contingency_table)
+total_obs <- sum(contingency_table)
+cohens_w <- sqrt(chi_sq_result$statistic / total_obs)
+
+
+
+
+
+
+
+```
+
+```{r The Aversive State Induction Successfully Increased Anxiety During Task Performance Across All Participants}
+
+## Self-Reported Anxiety
+# get anxiety during horizon task
+original_df = df %>% mutate(HT.self.anxiety.during.task.combined = HT.self.anxiety.during.task, context = task.resistance)
+# get baseline anxiety
+pre_df = df %>% filter(task.resistance == "Resistance") %>% mutate(HT.self.anxiety.during.task.combined = HT.self.anxiety.pre, context = "Baseline")
+final_df <- bind_rows(original_df, pre_df)
+final_df$context = as.factor(final_df$context)
+
+model = lmer(HT.self.anxiety.during.task.combined ~ group * context + sex+age.centered+old.horizon.version+list.sort.fully.corrected.t.score.centered+(1|id), data=final_df)
+model_summaries <- summarize_and_refine_model_lme(c(model))
+
+
+
+## STAI Anxiety
+original_df = df %>% mutate(HT.stai.anxiety.during.task.combined = HT.stai.anxiety.during.task,
+                            context = task.resistance)
+pre_df = df %>% filter(task.resistance == "Resistance") %>% mutate(HT.stai.anxiety.during.task.combined = HT.stai.anxiety.pre, context = "Baseline")
+final_df <- bind_rows(original_df, pre_df)
+
+model = lmer(HT.stai.anxiety.during.task.combined ~ group * context + sex+age.centered+old.horizon.version+list.sort.fully.corrected.t.score.centered+(1|id), data=final_df)
+model_summaries <- summarize_and_refine_model_lme(c(model))
+
+
+
+
+
+## Mock Scan Anxiety
+df_long <- df %>%
+   filter(task.resistance %in% c('Resistance')) %>%
+   pivot_longer(cols = c('pre.task.anxiety.0', 'pre.task.anxiety.1', 'pre.task.anxiety.2', 'pre.task.anxiety.3', 'pre.task.anxiety.4', 'pre.task.anxiety.5'),
+                names_to = "resistance_level",
+                values_to = "value") %>%
+   mutate(resistance_level = case_when(
+             resistance_level == "pre.task.anxiety.0" ~ as.numeric(0),
+             resistance_level == "pre.task.anxiety.1" ~ as.numeric(10),
+             resistance_level == "pre.task.anxiety.2" ~ as.numeric(20),
+             resistance_level == "pre.task.anxiety.3" ~ as.numeric(40),
+             resistance_level == "pre.task.anxiety.4" ~ as.numeric(60),
+             resistance_level == "pre.task.anxiety.5" ~ as.numeric(80),
+             TRUE ~ as.numeric(NA)  # Default case if none of the above matches
+          ))
+df_long$resistance_level_centered = gscale(df_long$resistance_level, center.only=TRUE)
+
+
+model <- lmer(value ~ resistance_level_centered * group + sex + age.centered +old.horizon.version+list.sort.fully.corrected.t.score.centered+(1 | id), data = df_long)
+model_summaries <- summarize_and_refine_model_lme(c(model))
+
+
+
+```
+
+```{r Individuals with MUD Show Lower Task Performance than Healthy Comparisons }
+
+## First Free Choice Accuracy
+df_long <- pivot_longer(
+  data = df, 
+  cols = c(h1.equal.1, h6.equal.1, h1.unequal.1, h6.unequal.1), 
+  names_to = c("horizon", "info_condition"), 
+  names_sep = "\\.", 
+  values_to = "accuracy"
+)
+df_long$horizon = factor(df_long$horizon)
+contrasts(df_long$horizon) <- matrix(c(-1, 1), ncol = 1)
+df_long$info_condition = factor(df_long$info_condition)
+contrasts(df_long$info_condition) <- matrix(c(-1, 1), ncol = 1)
+
+model = lmer(accuracy ~ horizon*group*info_condition + group*horizon*task.resistance+age.centered+sex+old.horizon.version+list.sort.fully.corrected.t.score.centered+(1|id), data=df_long)
+
+model_summaries <- summarize_and_refine_model_lme(c(model))
+# summarize function doesn't work for HorizonxGroup
+Anova(model,test="F")
+summary(model)
+F_to_eta2(f=131.99    , df=1, df_error=753)
+F_to_eta2(f=20.91    , df=1, df_error=103)
+F_to_eta2(f=74.32    , df=1, df_error=753)
+F_to_eta2(f=0.01    , df=1, df_error=753)
+F_to_eta2(f=8.76    , df=1, df_error=753)
+F_to_eta2(f=.88    , df=1, df_error=753)
+emmeans(model,pairwise ~ horizon|group)
+
+
+
+
+
+
+
+## Accuracy Across Choices of H6 Condition
+df_long <- df %>%
+  pivot_longer(
+    cols = c(h6.equal.1, h6.unequal.1, h6.equal.2, h6.unequal.2, h6.equal.3, h6.unequal.3, h6.equal.4, h6.unequal.4, h6.equal.5, h6.unequal.5, h6.equal.6, h6.unequal.6),
+    names_to = c("info_condition", "choice_number"), # names of the new columns
+    names_pattern = "h6\\.(equal|unequal)\\.(\\d+)", # pattern to extract "equal"/"unequal" and the choice number
+    values_to = "accuracy" # the name of the column to store the original values
+  )
+
+df_long$info_condition = factor(df_long$info_condition)
+contrasts(df_long$info_condition) <- matrix(c(-1, 1), ncol = 1)
+df_long <- df_long %>%mutate(choice_number = as.numeric(choice_number))
+df_long$choice_number_centered = gscale(df_long$choice_number, center.only=TRUE)
+
+
+model1 = lmer(accuracy ~ choice_number_centered*group*info_condition + group*choice_number_centered*task.resistance+age.centered+sex+old.horizon.version+(1|id), data=df_long)
+model2 = lmer(accuracy ~ choice_number_centered*group*info_condition + group*choice_number_centered*task.resistance+list.sort.fully.corrected.t.score.centered+
+              age.centered+sex+old.horizon.version+(1|id), data=df_long)
+
+
+
+models_list_H6 = c(model1,model2)
+model_summaries_H6 <- summarize_and_refine_model_lme(models_list_H6)
+
+```
+
+```{r Parameter Intercorrelations and Parameter Recoverability}
+## Correlations of Horizon Task Parameters
+df_no_resistance = df %>% filter(task.resistance == "No Resistance")
+df_resistance = df %>% filter(task.resistance == "Resistance")
+
+# get residuals for alpha inf no resistance
+lm <-  lm(alpha.inf ~ alpha.start, data = df_no_resistance)
+residuals_no_resistance <- residuals(lm)
+df_no_resistance$alpha_residuals = residuals_no_resistance
+
+# get residuals for alpha inf resistance
+lm <-  lm(alpha.inf ~ alpha.start, data = df_resistance)
+residuals_resistance <- residuals(lm)
+df_resistance$alpha_residuals = residuals_resistance
+
+
+vars = c("info.bonus.h6.h1.diff", "dec.noise.h6.h1.22.diff",  "alpha.start", "alpha_residuals")
+
+# do spearman's rank correlation for starting learning rate
+corrplotplus_CMG(df_no_resistance[,vars], second_db=df_resistance[,vars],include.R.diagonal=FALSE,use.BF = FALSE, use.sig = T, R.cex = .7, R.vjust = 0.00,type="pearson",cols_to_do_other_type = c(3))
+
+
+
+
+df$directed_exp = df$info.bonus.h6 - df$info.bonus.h1
+df$random_exp = df$dec.noise.h6.22 - df$dec.noise.h1.22
+
+df$simfit_directed_exp = df$simfit.info.bonus.h6 - df$simfit.info.bonus.h1
+df$simfit_random_exp = df$simfit.dec.noise.h6.22 - df$simfit.dec.noise.h1.22
+
+## Parameter Recoverability
+recoverability_cols <- c(
+  "info.bonus.h1", "info.bonus.h6",
+  "dec.noise.h1.22", "dec.noise.h1.13",
+  "dec.noise.h6.22", "dec.noise.h6.13",
+  "directed_exp", "random_exp",
+  "alpha.start", "alpha.inf",
+
+  
+  "simfit.info.bonus.h1", "simfit.info.bonus.h6",
+  "simfit.dec.noise.h1.22", "simfit.dec.noise.h1.13",
+  "simfit.dec.noise.h6.22", "simfit.dec.noise.h6.13",
+  "simfit_directed_exp", "simfit_random_exp",
+  "simfit.alpha.start", "simfit.alpha.inf")
+
+corrplotplus(df[, recoverability_cols], 1:10,11:20, use.BF = FALSE, use.sig=T ,sig.cex = .8, R.cex = .7, sig.vjust = -0.3, sig.hjust = 0.1, R.vjust = 0.00)
+
+
+
+
+```
+
+```{r Individuals with MUD Show Less Directed Exploration, Random Exploration, and Slower Learning Rates than Healthy Comparisons}
+### Test for outlier parameter values###
+
+## Directed Exploration - No Outliers
+df %>% filter(task.resistance=='Resistance') %$%
+ outliers::grubbs.test(.$info.bonus.h6.h1.diff, type=10, opposite = F)
+df %>% filter(task.resistance=='No Resistance') %$%
+ outliers::grubbs.test(.$info.bonus.h6.h1.diff, type=10, opposite = F)
+
+## Random Exploration - Two Outliers
+df %>% filter(task.resistance=='Resistance') %$%
+ outliers::grubbs.test(.$dec.noise.h6.h1.22.diff, type=10, opposite = F)
+df %>% filter(task.resistance=='No Resistance') %$%
+ outliers::grubbs.test(.$dec.noise.h6.h1.22.diff, type=10, opposite = F)
+# remove the highest value for Random Exploration
+df_no_outliers = df %>% mutate(dec.noise.h6.h1.22.diff = ifelse(task.resistance == 'No Resistance' & dec.noise.h6.h1.22.diff == max(dec.noise.h6.h1.22.diff, na.rm = TRUE), NA, dec.noise.h6.h1.22.diff))
+# test again for outliers
+df_no_outliers %>% filter(task.resistance=='No Resistance') %$%
+ outliers::grubbs.test(.$dec.noise.h6.h1.22.diff, type=10, opposite = F)
+# remove the highest value for Random Exploration
+df_no_outliers = df_no_outliers %>% mutate(dec.noise.h6.h1.22.diff = ifelse(task.resistance == 'No Resistance' & dec.noise.h6.h1.22.diff == max(dec.noise.h6.h1.22.diff, na.rm = TRUE), NA, dec.noise.h6.h1.22.diff))
+# test again for outliers
+df_no_outliers %>% filter(task.resistance=='No Resistance') %$%
+ outliers::grubbs.test(.$dec.noise.h6.h1.22.diff, type=10, opposite = F)
+
+
+## Asymptotic Learning Rate - No Outliers
+df %>% filter(task.resistance=='Resistance') %$%
+ outliers::grubbs.test(.$alpha.inf, type=10, opposite = F)
+df %>% filter(task.resistance=='No Resistance') %$%
+ outliers::grubbs.test(.$alpha.inf, type=10, opposite = F)
+
+## one outlier value
+
+
+## Test for parameter differences including outliers and without working memory as a covariate
+model1 = lmer(info.bonus.h6.h1.diff ~ group * task.resistance + age.centered+sex+old.horizon.version+(1|id), data=df)
+model2 = lmer(dec.noise.h6.h1.22.diff ~ group * task.resistance + age.centered+sex+old.horizon.version+(1|id),data=df)
+model3 <- glmer(alpha.start.cluster ~ group * task.resistance + age.centered+sex+old.horizon.version+(1|id), control = glmerControl(optimizer = "bobyqa"),family = 'binomial',df)
+model4 = lmer(alpha.inf ~ group * task.resistance + age.centered+sex+old.horizon.version+alpha.start.centered+(1|id), data=df)
+
+models_list = c(model1,model2,model3,model4)
+model_summaries <- summarize_and_refine_model_lme(models_list)
+
+## Test for parameter differences without outliers and without working memory as a covariate
+model = lmer(dec.noise.h6.h1.22.diff ~ group * task.resistance + age.centered+sex+old.horizon.version+(1|id),data=df_no_outliers)
+model_summaries <- summarize_and_refine_model_lme(c(model))
+
+# Get proportion of HCs and iMUDs in each cluster
+mean(df$alpha.start.cluster[df$group == "HC"] == 1)
+mean(df$alpha.start.cluster[df$group == "iMUD"] == 1)
+
+
+
+## with working memory as a covariate
+model1 = lmer(info.bonus.h6.h1.diff ~ group * task.resistance + age.centered+sex+old.horizon.version+list.sort.fully.corrected.t.score.centered+(1|id), data=df)
+model2 = lmer(dec.noise.h6.h1.22.diff ~ group * task.resistance + age.centered+sex+old.horizon.version+list.sort.fully.corrected.t.score.centered+(1|id),data=df)
+model3 <- glmer(alpha.start.cluster ~ group * task.resistance + age.centered+sex+old.horizon.version+list.sort.fully.corrected.t.score.centered+(1|id), control = glmerControl(optimizer = "bobyqa"),family = 'binomial',df)
+model4 = lmer(alpha.inf ~ group * task.resistance + age.centered+sex+old.horizon.version+list.sort.fully.corrected.t.score.centered+alpha.start.centered+(1|id), data=df)
+
+models_list = c(model1,model2,model3,model4)
+model_summaries_WM <- summarize_and_refine_model_lme(models_list)
+
+```
+
+```{r Complementary Analyses Showing Group Differences in Parameters }
+
+### Information Bonus ###
+long_df <- df %>%
+  pivot_longer(
+    cols = c("info.bonus.h1", "info.bonus.h6", 
+             "info.bonus.h1.var", "info.bonus.h6.var"),
+    names_to = "condition",
+    values_to = "value"
+  ) %>%
+  mutate(
+    Horizon = case_when(
+      condition == "info.bonus.h1" ~ "H1",
+      condition == "info.bonus.h6" ~ "H6",
+      condition == "info.bonus.h1.var" ~ "H1",
+      condition == "info.bonus.h6.var" ~ "H6"
+    ),
+    Type = case_when(
+      grepl(".var$", condition) ~ "se_long",
+      TRUE ~ "info_value"
+    )
+  ) %>%
+  select(-condition) %>%
+  pivot_wider(names_from = Type, values_from = value)
+
+# verify correct pivot
+# view(long_df %>% dplyr::select(id, Horizon, info_value, se_long))
+# code horizon as a factor
+long_df$Horizon = as.factor(long_df$Horizon)
+contrasts(long_df$Horizon) <- matrix(c(-1, 1), ncol = 1)
+# take the square root to get standard deviation
+long_df_rooted = long_df
+long_df_rooted$se_long = long_df$se_long^.5
+
+## Frequentist models
+model = lmer(info_value ~ group*Horizon + age.centered+sex+old.horizon.version+(1|id), data=long_df_rooted)
+model_wm = lmer(info_value ~ group*Horizon +age.centered+sex+old.horizon.version+list.sort.fully.corrected.t.score.centered+(1|id), data=long_df_rooted)
+model_summaries <- summarize_and_refine_model_lme(c(model,model_wm))
+
+## Bayesian model
+model <- brm(info_value | se(se_long,sigma = TRUE) ~ group*Horizon + old.horizon.version + sex +age.centered + (1|id), data = long_df_rooted, iter=4000, seed = 23, save_pars = save_pars(all = TRUE))
+summary(model)
+reduced_model_no_interaction <- brm(info_value | se(se_long, sigma = TRUE) ~ group + Horizon + old.horizon.version + sex + age.centered + (1|id), data = long_df_rooted, iter = 4000, seed = 23, save_pars = save_pars(all = TRUE))
+bayes_factor(model, reduced_model_no_interaction)
+
+
+
+### Decision Noise ###
+long_df <- df %>%
+  pivot_longer(
+    cols = c("dec.noise.h1.22", "dec.noise.h6.22", 
+             "dec.noise.h1.22.var", "dec.noise.h6.22.var"),
+    names_to = "condition",
+    values_to = "value"
+  ) %>%
+  mutate(
+    Horizon = case_when(
+      condition == "dec.noise.h1.22" ~ "H1",
+      condition == "dec.noise.h6.22" ~ "H6",
+      condition == "dec.noise.h1.22.var" ~ "H1",
+      condition == "dec.noise.h6.22.var" ~ "H6"
+    ),
+    Type = case_when(
+      grepl(".var$", condition) ~ "se_long",
+      TRUE ~ "dec_noise_value"
+    )
+  ) %>%
+  select(-condition) %>%
+  pivot_wider(names_from = Type, values_from = value)
+
+# verify correct pivot
+# view(long_df %>% dplyr::select(id, Horizon, dec_noise_value, se_long))
+# code horizon as a factor
+long_df$Horizon = as.factor(long_df$Horizon)
+contrasts(long_df$Horizon) <- matrix(c(-1, 1), ncol = 1)
+# take the square root to get standard deviation
+long_df_rooted = long_df
+long_df_rooted$se_long = long_df$se_long^.5
+
+
+## Frequentist models
+model = lmer(dec_noise_value ~ group*Horizon + age.centered+sex+old.horizon.version+(1|id), data=long_df_rooted)
+model_wm = lmer(dec_noise_value ~ group*Horizon +age.centered+sex+old.horizon.version+list.sort.fully.corrected.t.score.centered+(1|id), data=long_df_rooted)
+model_summaries <- summarize_and_refine_model_lme(c(model,model_wm))
+
+## Bayesian model
+model <- brm(dec_noise_value | se(se_long,sigma = TRUE) ~ group*Horizon + old.horizon.version + sex +age.centered + (1|id), data = long_df_rooted, iter=4000, seed = 23,save_pars = save_pars(all = TRUE))
+summary(model)
+reduced_model_no_interaction <- brm(dec_noise_value | se(se_long,sigma = TRUE) ~ group + Horizon + old.horizon.version + sex +age.centered + (1|id), data = long_df_rooted, iter=4000, seed = 23,save_pars = save_pars(all = TRUE))
+bayes_factor(model, reduced_model_no_interaction)
+
+
+
+
+### Learning Rates ###
+df_rooted = df
+df_rooted$alpha.inf.var = df$alpha.inf.var^.5
+df_rooted$alpha.start.var = df$alpha.start.var^.5
+df_rooted$alpha.start.centered = gscale(df$alpha.start,center.only = T)
+
+# note that SE is not supported for binomial, so we use continuous parameter value 
+model1 <- brm(alpha.start| se(alpha.start.var,sigma = TRUE) ~ group*task.resistance + old.horizon.version + sex +age.centered + (1|id), data = df_rooted, iter=4000,seed = 23, save_pars = save_pars(all = TRUE))
+summary(model1)
+reduced_model <- brm(alpha.start| se(alpha.start.var,sigma = TRUE) ~ task.resistance + old.horizon.version + sex +age.centered + (1|id), data = df_rooted, iter=4000,seed = 23, save_pars = save_pars(all = TRUE))
+bayes_factor(model1, reduced_model)
+
+
+
+model3 <- brm(alpha.inf | se(alpha.inf.var,sigma = TRUE) ~ group*task.resistance + old.horizon.version + sex +age.centered +(1|id), iter=4000, data = df_rooted, seed = 23, save_pars = save_pars(all = TRUE))
+summary(model3)
+reduced_model <- brm(alpha.inf | se(alpha.inf.var,sigma = TRUE) ~ task.resistance + old.horizon.version + sex +age.centered +(1|id), iter=4000, data = df_rooted, seed = 23, save_pars = save_pars(all = TRUE))
+bayes_factor(model3, reduced_model)
+
+model2 <- brm(alpha.inf | se(alpha.inf.var,sigma = TRUE) ~ group*task.resistance + old.horizon.version + sex +age.centered + alpha.start.centered+(1|id), iter=4000, data = df_rooted, seed = 23, save_pars = save_pars(all = TRUE))
+summary(model2)
+reduced_model <- brm(alpha.inf | se(alpha.inf.var,sigma = TRUE) ~ task.resistance + old.horizon.version + sex +age.centered + alpha.start.centered+(1|id), iter=4000, data = df_rooted, seed = 23, save_pars = save_pars(all = TRUE))
+bayes_factor(model2, reduced_model)
+
+
+
+```
+
+```{r Individuals with MUD Showed Greater Avoidance of Uncertainty}
+# Negative Outcome Avoidance - number of times a person chose low information side when better 
+# Uncertainty Avoidance - number of times person chose high info side when it was worse 
+
+df$h6.avg.high.mean.high.info <- rowMeans(df[, c(
+  "h6.more.info.04.more", 
+  "h6.more.info.08.more", 
+  "h6.more.info.12.more", 
+  "h6.more.info.20.more", 
+  "h6.more.info.30.more"
+)])  
+
+df$h1.avg.high.mean.high.info <- rowMeans(df[, c(
+  "h1.more.info.04.more", 
+  "h1.more.info.08.more", 
+  "h1.more.info.12.more", 
+  "h1.more.info.20.more", 
+  "h1.more.info.30.more"
+)])  
+
+df$h6.avg.low.mean.high.info <- rowMeans(df[, c(
+  "h6.more.info.04.less", 
+  "h6.more.info.08.less", 
+  "h6.more.info.12.less", 
+  "h6.more.info.20.less", 
+  "h6.more.info.30.less"
+)]) 
+
+df$h1.avg.low.mean.high.info <- rowMeans(df[, c(
+  "h1.more.info.04.less", 
+  "h1.more.info.08.less", 
+  "h1.more.info.12.less", 
+  "h1.more.info.20.less", 
+  "h1.more.info.30.less"
+)])  
+
+# Test for differences in Uncertainty Avoidance
+model = lmer(h6.avg.high.mean.high.info ~ h1.avg.high.mean.high.info + group + task.resistance + age.centered+sex+old.horizon.version + (1|id), df)
+model_wm = lmer(h6.avg.high.mean.high.info ~ h1.avg.high.mean.high.info + group + task.resistance + age.centered+sex+old.horizon.version+list.sort.fully.corrected.t.score.centered+ (1|id), df)
+model_summaries <- summarize_and_refine_model_lme(c(model,model_wm))
+
+
+# Test for differences in Negative Outcome Avoidance
+df$h6.avg.high.mean.low.info = 1 - df$h6.avg.low.mean.high.info
+df$h1.avg.high.mean.low.info = 1 - df$h1.avg.low.mean.high.info
+
+model = lmer(h6.avg.high.mean.low.info ~ h1.avg.high.mean.low.info + group + task.resistance + age.centered+sex+old.horizon.version + (1|id), df)
+model_wm = lmer(h6.avg.high.mean.low.info ~ h1.avg.high.mean.low.info + group + task.resistance + age.centered+sex+old.horizon.version+list.sort.fully.corrected.t.score.centered+ (1|id), df)
+model_summaries <- summarize_and_refine_model_lme(c(model,model_wm))
+
+
+
+
+ 
+```
+
+```{r Somatic Anxiety Does Not Relate to Task Performance }
+df$HT.self.anxiety.during.task.centered = gscale(df$HT.self.anxiety.during.task,center.only = T)
+
+# DE
+model1 = lmer(info.bonus.h6.h1.diff ~ group * task.resistance + HT.self.anxiety.during.task.centered*task.resistance + (1|id)+age.centered +sex + old.horizon.version, data=df)
+
+# RE
+model2 = lmer(dec.noise.h6.h1.22.diff ~ group * task.resistance + HT.self.anxiety.during.task.centered*task.resistance + (1|id)+age.centered +sex + old.horizon.version, data=df)
+
+# Alpha Start
+model3 <- df %>% 
+  glmer(alpha.start.cluster ~ group * task.resistance + HT.self.anxiety.during.task.centered*task.resistance + (1|id)+age.centered +sex + old.horizon.version, data=., control = glmerControl(optimizer = "bobyqa"),family = 'binomial')
+
+# Alpha Inf
+model4 = lmer(alpha.inf ~ group * task.resistance + HT.self.anxiety.during.task.centered*task.resistance + (1|id)+age.centered +sex + old.horizon.version + alpha.start.centered, data=df)
+
+
+model_summaries <- summarize_and_refine_model_lme(c(model1,model2,model3,model4))
+
+
+```
+
+```{r Computational Parameters did not Relate to Substance Use Symptoms}
+df_iMUD = df %>% filter(group=="iMUD")
+# re-center variables
+df_iMUD$age.centered = gscale(df_iMUD$age, center.only = T)
+df_iMUD$MAWQ.total.centered = gscale(df_iMUD$MAWQ.total, center.only = T)
+df_iMUD$DAST.centered = gscale(df_iMUD$DAST, center.only = T)
+df_iMUD$list.sort.fully.corrected.t.score.centered = gscale(df_iMUD$list.sort.fully.corrected.t.score, center.only = T)
+df_iMUD$alpha.start.centered = gscale(df_iMUD$alpha.start, center.only = T)
+
+model1 = lmer(info.bonus.h6.h1.diff ~ task.resistance*MAWQ.total.centered + age.centered+sex+list.sort.fully.corrected.t.score.centered+(1|id), data=df_iMUD)
+model2 = lmer(dec.noise.h6.h1.22.diff ~ task.resistance*MAWQ.total.centered + age.centered+sex+list.sort.fully.corrected.t.score.centered+(1|id), data=df_iMUD)
+model3 = lmer(alpha.start  ~ task.resistance*MAWQ.total.centered + age.centered+sex+list.sort.fully.corrected.t.score.centered+(1|id), data=df_iMUD)
+model4 = lmer(alpha.inf ~ task.resistance*MAWQ.total.centered + alpha.start.centered+age.centered+sex+list.sort.fully.corrected.t.score.centered+(1|id), data=df_iMUD)
+model_summaries <- summarize_and_refine_model_lme(c(model1,model2,model3,model4))
+
+
+
+model5 = lmer(info.bonus.h6.h1.diff ~ task.resistance*DAST.centered + age.centered+sex+list.sort.fully.corrected.t.score.centered+(1|id), data=df_iMUD)
+model6 = lmer(dec.noise.h6.h1.22.diff ~ task.resistance*DAST.centered + age.centered+sex+list.sort.fully.corrected.t.score.centered+(1|id), data=df_iMUD)
+model7 = lmer(alpha.start ~ task.resistance*DAST.centered +age.centered+sex+list.sort.fully.corrected.t.score.centered+(1|id), data=df_iMUD)
+model8 = lmer(alpha.inf ~ task.resistance*DAST.centered + age.centered+sex+alpha.start.centered+list.sort.fully.corrected.t.score.centered+(1|id), data=df_iMUD)
+model_summaries <- summarize_and_refine_model_lme(c(model5,model6,model7,model8))
+
+
+## residualized DSQ
+df_iMUD$DSQ.change <- df_iMUD$postmock.DSQ - df_iMUD$premock.DSQ
+
+df_slice = df_iMUD %>% group_by(id) %>% 
+  slice(1) 
+model = lm(DSQ.change ~ premock.DSQ, df_slice)
+dsq_resid = residuals(model)
+df_slice$DSQ_resid = NA
+for (id in names(dsq_resid)) {
+  df_slice[id,"DSQ_resid"] = dsq_resid[id]
+}
+df_slice = df_slice %>% select(c(id,DSQ_resid))
+df_iMUD = merge(df_iMUD, df_slice, by = "id", all.x = TRUE)
+df_iMUD$premock.DSQ.centered = gscale(df_iMUD$premock.DSQ, center.only = T)
+
+# check for outliers
+df_iMUD %>% filter(task.resistance=='Resistance') %$%
+ outliers::grubbs.test(.$DSQ_resid, type=10, opposite = F)
+df_iMUD %>% filter(task.resistance=='No Resistance') %$%
+ outliers::grubbs.test(.$DSQ_resid, type=10, opposite = F)
+# remove outlier
+df_iMUD_no_outliers = df_iMUD %>% filter(DSQ_resid != max(df_iMUD$DSQ_resid, na.rm = TRUE))
+
+df_iMUD_no_outliers$DSQ_resid_centered = gscale(df_iMUD_no_outliers$DSQ_resid, center.only = T)
+
+  
+
+model9 = lmer(info.bonus.h6.h1.diff ~ task.resistance*DSQ_resid_centered +task.resistance*premock.DSQ.centered+ age.centered+sex+list.sort.fully.corrected.t.score.centered+(1|id), data=df_iMUD_no_outliers)
+model10 = lmer(dec.noise.h6.h1.22.diff ~ task.resistance*DSQ_resid_centered +task.resistance*premock.DSQ.centered+ age.centered+sex+list.sort.fully.corrected.t.score.centered+(1|id), data=df_iMUD_no_outliers)
+model11 = lmer(alpha.start ~ task.resistance*DSQ_resid_centered +task.resistance*premock.DSQ.centered+ age.centered+sex+list.sort.fully.corrected.t.score.centered+(1|id), data=df_iMUD_no_outliers)
+model12 <- lmer(alpha.inf ~ task.resistance*DSQ_resid_centered +task.resistance*premock.DSQ.centered + age.centered+sex+alpha.start.centered+list.sort.fully.corrected.t.score.centered+(1|id), data=df_iMUD_no_outliers)
+model_summaries <- summarize_and_refine_model_lme(c(model9,model10,model11,model12))
+
+
+
+```
+
+```{r Computational Parameters did not Relate to Affective Symptoms/Medication/Treatment}
+# filter to iMUDS
+df_iMUD = df %>% filter(group=="iMUD")
+df_iMUD$medicated = factor(df_iMUD$medicated)
+contrasts(df_iMUD$medicated) <- matrix(c(-1, 1), ncol = 1)
+# recenter age, alpha start
+df_iMUD$age.centered = gscale(df_iMUD$age,center.only = T)
+df_iMUD$alpha.start.centered = gscale(df_iMUD$alpha.start,center.only = T)
+df_iMUD$list.sort.fully.corrected.t.score.centered = gscale(df_iMUD$list.sort.fully.corrected.t.score,center.only = T)
+df_iMUD$UPPSP.total.centered = gscale(df_iMUD$UPPSP.total,center.only = T)
+df_iMUD$PHQ.score.centered = gscale(df_iMUD$PHQ.score,center.only = T)
+df_iMUD$STAIt.score.centered = gscale(df_iMUD$STAIt.score,center.only = T)
+df_iMUD$days.since.tx.start.centered = gscale(df_iMUD$days.since.tx.start,center.only = T)
+df_iMUD$last.meth.use.centered = gscale(df_iMUD$last.meth.use,center.only = T)
+
+
+
+create_models <- function(data, predictor) {
+  # Create the formulas for each model
+  formulas <- list(
+    info_bonus = as.formula(paste0("info.bonus.h6.h1.diff ~ ", predictor, " + task.resistance + age.centered + sex + (1 | id)")),
+    dec_noise = as.formula(paste0("dec.noise.h6.h1.22.diff ~ ", predictor, " + task.resistance + age.centered + sex + (1 | id)")),
+    alpha_start = as.formula(paste0("alpha.start ~ ", predictor, " + task.resistance + age.centered + sex + (1 | id)")),
+    alpha_inf = as.formula(paste0("alpha.inf ~ ", predictor, " + task.resistance + alpha.start.centered + age.centered + sex + (1 | id)"))
+  )
+  # Fit the models
+  models <- list(
+    model_info_bonus = lmer(formulas$info_bonus, data = data),
+    model_dec_noise  = lmer(formulas$dec_noise, data = data),
+    model_alpha_start = lmer(formulas$alpha_start, data = data),
+    model_alpha_inf  = lmer(formulas$alpha_inf, data = data)
+  )
+  
+  return(models)
+}
+
+models = create_models(df_iMUD, "UPPSP.total.centered")
+summaries <- summarize_and_refine_model_lme(models)
+
+models = create_models(df_iMUD, "PHQ.score.centered")
+summaries <- summarize_and_refine_model_lme(models)
+
+models = create_models(df_iMUD, "STAIt.score.centered")
+summaries <- summarize_and_refine_model_lme(models)
+
+models = create_models(df_iMUD, "medicated")
+summaries <- summarize_and_refine_model_lme(models)
+
+models = create_models(df_iMUD, "days.since.tx.start.centered")
+summaries <- summarize_and_refine_model_lme(models)
+
+models = create_models(df_iMUD, "last.meth.use.centered")
+summaries <- summarize_and_refine_model_lme(models)
+
+models = create_models(df_iMUD, "has.opioid")
+summaries <- summarize_and_refine_model_lme(models)
+
+models = create_models(df_iMUD, "has.alcohol")
+summaries <- summarize_and_refine_model_lme(models)
+
+models = create_models(df_iMUD, "has.cannabis")
+summaries <- summarize_and_refine_model_lme(models)
+
+```
+
+```{r Greater Exploration and Faster Learning Rates each Improved Performance}
+## center params since they will be predictors
+df$info.bonus.h6.centered = gscale(df$info.bonus.h6,center.only = T)
+df$dec.noise.h6.22.centered = gscale(df$dec.noise.h6.22,center.only = T)
+df$alpha.start.centered = gscale(df$alpha.start,center.only = T)
+df$alpha.inf.centered = gscale(df$alpha.inf,center.only = T)
+
+
+### Unequal Information Accuracy
+df_accuracy_unequal <- pivot_longer(
+  data = df, 
+  cols = c(h6.unequal.2, h6.unequal.3, h6.unequal.4, h6.unequal.5, h6.unequal.6), 
+  names_to = "choice_number", 
+  values_to = "accuracy"
+) %>%mutate(
+    choice_number = gscale(as.numeric(str_extract(choice_number, "[0-9]+$")) - 1,center.only = T)
+  )
+
+# Information Bonus
+model1 = lmer(accuracy ~ age.centered+old.horizon.version+sex+task.resistance+ group+ info.bonus.h6.centered*choice_number + list.sort.fully.corrected.t.score.centered+(1|id), data=df_accuracy_unequal)
+## Starting Alpha
+model2 = lmer(accuracy ~ age.centered+old.horizon.version+sex+task.resistance+ group+ alpha.start.centered*choice_number + list.sort.fully.corrected.t.score.centered+(1|id), data=df_accuracy_unequal)
+## Asymptotic Alpha
+model3 = lmer(accuracy ~ age.centered+old.horizon.version+sex+task.resistance+ group+ alpha.inf.centered*choice_number + list.sort.fully.corrected.t.score.centered+(1|id), data=df_accuracy_unequal)
+
+summaries <- summarize_and_refine_model_lme(c(model1,model2,model3))
+
+
+### Equal Information Accuracy
+df_accuracy_equal <- pivot_longer(
+  data = df, 
+  cols = c(h6.equal.2, h6.equal.3, h6.equal.4, h6.equal.5, h6.equal.6), 
+  names_to = "choice_number", 
+  values_to = "accuracy"
+) %>%mutate(
+    choice_number = gscale(as.numeric(str_extract(choice_number, "[0-9]+$")) - 1,center.only = T)
+  )
+
+# DECISION NOISE
+model4 = lmer(accuracy ~ age.centered+old.horizon.version+sex+task.resistance+ group+ dec.noise.h6.22.centered*choice_number + list.sort.fully.corrected.t.score.centered+(1|id), data=df_accuracy_equal)
+# Starting Alpha
+model5 = lmer(accuracy ~ age.centered+old.horizon.version+sex+ task.resistance+ group+alpha.start.centered*choice_number + list.sort.fully.corrected.t.score.centered+(1|id),data=df_accuracy_equal)
+# Asymptotic Alpha
+model6 = lmer(accuracy ~ age.centered+old.horizon.version+sex+ task.resistance+ group+ alpha.inf.centered*choice_number + list.sort.fully.corrected.t.score.centered+(1|id), data=df_accuracy_equal)
+
+summaries <- summarize_and_refine_model_lme(c(model4,model5,model6))
+
+
+```
+
+```{r Directed Exploration and Learning Rates were Predicted by Cognitive Reflectiveness}
+df$CRT.num.correct.centered = gscale(df$CRT.num.correct,center.only = T)
+
+# In whole sample
+model1 = lmer(info.bonus.h6.h1.diff ~ CRT.num.correct.centered + task.resistance +age.centered+sex+old.horizon.version+ group+(1|id),df)
+model2 = lmer(dec.noise.h6.h1.22.diff ~ CRT.num.correct.centered + task.resistance +age.centered+sex+old.horizon.version+ group+(1|id),df)
+model3 = glmer(alpha.start.cluster ~ CRT.num.correct.centered + task.resistance +age.centered+sex+old.horizon.version+group +(1|id), df, control = glmerControl(optimizer = "bobyqa"),family = 'binomial')
+model4 = lmer(alpha.inf ~ CRT.num.correct.centered + task.resistance +age.centered+sex+old.horizon.version+ alpha.start.centered+group+(1|id), df)
+
+summaries <- summarize_and_refine_model_lme(c(model1,model2,model3,model4))
+
+
+# In whole sample controlling for working memory
+model1 = lmer(info.bonus.h6.h1.diff ~ list.sort.fully.corrected.t.score.centered + CRT.num.correct.centered + task.resistance +age.centered+sex+old.horizon.version+ group+(1|id),df)
+model2 = lmer(dec.noise.h6.h1.22.diff ~ list.sort.fully.corrected.t.score.centered + CRT.num.correct.centered + task.resistance +age.centered+sex+old.horizon.version+ group+(1|id),df)
+model3 = glmer(alpha.start.cluster ~ list.sort.fully.corrected.t.score.centered + CRT.num.correct.centered + task.resistance +age.centered+sex+old.horizon.version+group +(1|id), df, control = glmerControl(optimizer = "bobyqa"),family = 'binomial')
+model4 = lmer(alpha.inf ~ list.sort.fully.corrected.t.score.centered + CRT.num.correct.centered + task.resistance +age.centered+sex+old.horizon.version+ alpha.start.centered+group+(1|id), df)
+
+summaries <- summarize_and_refine_model_lme(c(model1,model2,model3,model4))
+
+
+
+
+# In iMUDs
+df_iMUD = df %>% filter(group=="iMUD")
+df_iMUD$age.centered = gscale(df_iMUD$age,center.only = T)
+df_iMUD$alpha.start.centered = gscale(df_iMUD$alpha.start,center.only = T)
+df_iMUD$list.sort.fully.corrected.t.score.centered = gscale(df_iMUD$list.sort.fully.corrected.t.score,center.only = T)
+
+
+model1 = lmer(info.bonus.h6.h1.diff ~ CRT.num.correct.centered + task.resistance +age.centered+sex+(1|id),df_iMUD)
+model2 = lmer(dec.noise.h6.h1.22.diff ~ CRT.num.correct.centered + task.resistance +age.centered+sex+(1|id),df_iMUD)
+model3 = lmer(alpha.start ~  CRT.num.correct.centered + task.resistance +age.centered+sex+(1|id),df_iMUD)
+model4 = lmer(alpha.inf ~ CRT.num.correct.centered + task.resistance +age.centered+sex+ alpha.start.centered+(1|id), df_iMUD)
+
+summaries <- summarize_and_refine_model_lme(c(model1,model2,model3,model4))
+
+
+
+```
+
+```{r Cognitive Reflectiveness Mediates the Group Difference in DE and Alpha Start}
+# Directed Exploration
+# filter before centering in dat_subj since LMs can't account for missing data in predictors
+dat_subj <- df %>% 
+  filter(if_all(c(group, CRT.num.correct, age, sex, old.horizon.version), ~ !is.na(.))) %>%
+  mutate(CRT.num.correct.centered= as.numeric(scale(CRT.num.correct,scale=F))) %>%
+  mutate(age.centered= as.numeric(scale(age,scale=F))) %>%
+  group_by(id) %>% filter(task.resistance=="No Resistance") %>%
+  select(id,group,CRT.num.correct.centered, age.centered,sex, old.horizon.version) %>% as.data.frame %>%
+  mutate(id.num = 1:n())
+
+
+dat <- dat_subj %>% select(id,id.num) %>%
+  merge(df, ., by='id') %>%
+  mutate(CRT.num.correct.centered= as.numeric(scale(CRT.num.correct,scale=F))) %>%
+  mutate(age.centered= as.numeric(scale(age,scale=F)))
+
+
+
+lm1 <- lm(CRT.num.correct.centered ~ group+sex+age.centered+old.horizon.version, data=dat_subj)
+lm2 <- lmer(info.bonus.h6.h1.diff ~ CRT.num.correct.centered+group+task.resistance+sex+old.horizon.version+age.centered+(1|id), data=dat)
+set.seed(2024)
+model <- mediation::mediate(lm1, lm2, treat="group", mediator = "CRT.num.correct.centered", sims = 5000)
+summary(model)
+
+
+# Starting Learning Rate 
+lm1 <- lm(CRT.num.correct.centered ~ group+sex+age.centered+old.horizon.version, data=dat_subj)
+lm2 <- lmer(alpha.start ~ CRT.num.correct.centered+group+task.resistance+sex+old.horizon.version+age.centered+(1|id), data=dat)
+set.seed(2024)
+model <- mediation::mediate(lm1, lm2, treat="group", mediator = "CRT.num.correct.centered", sims = 5000)
+summary(model)
+
+
+
+```
+
+
+```{r Create Plot for Parameters}
+group.colors = c("#2E86C1", "#2ECC71") 
+
+std.error <- function(x) {
+  sd(x) / sqrt(length(x))
+}
+
+my.raincloud <- function(data_2x2,
+                                 colors = (c('#2E86C1', '#2ECC71', '#2E86C1', '#2ECC71')),
+                                 fills = (c('#2E86C1', '#2ECC71', '#2E86C1', '#2ECC71')),
+                                 line_color = 'gray',
+                                 line_alpha = .3,
+                                 size = 1.5,
+                                 alpha = .6) {
+
+  sum <- data_2x2 %>% dplyr::rename(res='group') %>%
+    group_by(res, x_axis) %>%
+    dplyr::summarize(mean=mean(y_axis), se=std.error(y_axis)) %>%
+    as.data.frame %>% mutate(upper=mean+se) %>% mutate(lower=mean-se) %>%
+    suppressMessages()
+  
+  figure_2x2 <- ggplot(data = data_2x2) +
+    
+    #Add geom_() objects
+    geom_point(data = data_2x2 %>% dplyr::filter(x_axis =="1"), aes(x = jit, y = y_axis), color = colors[1], fill = fills[1], size = size,
+               alpha = .75) +
+    geom_point(data = data_2x2 %>% dplyr::filter(x_axis =="1.01"), aes(x = jit, y = y_axis), color = colors[2], fill = fills[2], size = size,
+               alpha = .75) +
+    geom_point(data = data_2x2 %>% dplyr::filter(x_axis =="2"), aes(x = jit, y = y_axis), color = colors[3], fill = fills[3], size = size,
+               alpha = .75) +
+    geom_point(data = data_2x2 %>% dplyr::filter(x_axis =="2.01"), aes(x = jit, y = y_axis), color = colors[4], fill = fills[4], size = size,
+               alpha = .75) +
+    
+    geom_line(data = data_2x2, aes(x=jit, y = y_axis, group=id), inherit.aes = F, alpha=.2) +
+    geom_line(data = data_2x2 %>% dplyr::filter(x_axis %in% c("1", "2")), aes(x = jit, y = y_axis, group = id), color = colors[1], alpha = .2) +
+    geom_line(data = data_2x2 %>% dplyr::filter(x_axis %in% c("1.01", "2.01")), aes(x = jit, y = y_axis, group = id), color = colors[2], alpha = .2) +
+    
+    #geom_line(data = sum, aes(x = x_axis, y = mean, color = res, group = res), linewidth = 1) +
+    geom_ribbon(data = sum, aes(x = x_axis, ymin = upper, ymax = lower, group = res, fill = res), alpha=.8,
+                inherit.aes = F, colour = NA)+
+    # Update this line to make the mean lines black and thinner
+    geom_line(data = sum, aes(x = x_axis, y = mean, group = res), color = 'black', linewidth = 0.7) +
+
+    scale_color_manual(values = c('#2E86C1', '#2ECC71')) +
+    scale_fill_manual(values = c('#2E86C1', '#2ECC71')) +
+ 
+    geom_half_violin(
+      data = data_2x2 %>% dplyr::filter(x_axis=="1"),aes(x = x_axis, y = y_axis), color = colors[1], fill = fills[1], position = position_nudge(x = -.35),
+      side = "l", alpha = alpha) +
+    
+    
+    geom_half_violin(
+      data = data_2x2 %>% dplyr::filter(x_axis=="1.01"),aes(x = x_axis, y = y_axis), color = colors[2], fill = fills[2], position = position_nudge(x = -.36),
+      side = "l", alpha = alpha) +
+    
+    
+    geom_half_violin(
+      data = data_2x2 %>% dplyr::filter(x_axis=="2"),aes(x = x_axis, y = y_axis), color = colors[3], fill = fills[3], position = position_nudge(x = .35),
+      side = "r", alpha = alpha) +
+
+    
+    geom_half_violin(
+      data = data_2x2 %>% dplyr::filter(x_axis=="2.01"),aes(x = x_axis, y = y_axis), color = colors[4], fill = fills[4], position = position_nudge(x = .34),
+      side = "r", alpha = alpha) 
+  
+  return(figure_2x2)
+  
+  
+}
+
+## Directed Exploration Based on Resistance Condition
+df_2x2_complete <- df %>% 
+  pivot_wider(id_cols = 'id', names_from = c('group','task.resistance'),values_from='info.bonus.h6.h1.diff') %>%
+  as.data.frame %$%
+  data_2x2(array_1 = .$`HC_No Resistance`,
+                               array_2 = .$`iMUD_No Resistance`,
+                               array_3 = .$`HC_Resistance`,
+                               array_4 = .$iMUD_Resistance,
+                               labels = (c('No Resistance','Resistance')),jit_distance = .09,jit_seed = 321,spread_x_ticks = F)
+my.raincloud(data = df_2x2_complete, size = 2,alpha = .65) + 
+  scale_x_continuous(breaks=c(1,2), labels=c("No Resistance", "Resistance"), limits=c(0, 3))  + 
+  xlab("Resistance Condition") + theme_classic()+guides(color = "none", fill = "none")
+
+
+
+## Random Exploration Based on Resistance Condition
+df_2x2_complete <- df %>% 
+  pivot_wider(id_cols = 'id', names_from = c('group','task.resistance'),values_from='dec.noise.h6.h1.22.diff') %>%
+  as.data.frame %$%
+  data_2x2(array_1 = .$`HC_No Resistance`,
+                               array_2 = .$`iMUD_No Resistance`,
+                               array_3 = .$`HC_Resistance`,
+                               array_4 = .$iMUD_Resistance,
+                               labels = (c('No Resistance','Resistance')),jit_distance = .09,jit_seed = 321,spread_x_ticks = F)
+my.raincloud(data = df_2x2_complete, size = 2,alpha = .65) + 
+  scale_x_continuous(breaks=c(1,2), labels=c("No Resistance", "Resistance"), limits=c(0, 3))  + 
+  xlab("Resistance Condition") + theme_classic()+guides(color = "none", fill = "none")
+
+
+
+
+
+## Starting Learning Rate Based on Resistance Condition
+df_2x2_complete <- df %>% 
+  pivot_wider(id_cols = 'id', names_from = c('group','task.resistance'),values_from='alpha.start') %>%
+  as.data.frame %$%
+  data_2x2(array_1 = .$`HC_No Resistance`,
+                               array_2 = .$`iMUD_No Resistance`,
+                               array_3 = .$`HC_Resistance`,
+                               array_4 = .$iMUD_Resistance,
+                               labels = (c('No Resistance','Resistance')),jit_distance = .09,jit_seed = 321,spread_x_ticks = F)
+my.raincloud(data = df_2x2_complete, size = 2,alpha = .65) + 
+  scale_x_continuous(breaks=c(1,2), labels=c("No Resistance", "Resistance"), limits=c(0, 3))  + 
+  xlab("Resistance Condition") + theme_classic()+guides(color = "none", fill = "none")
+
+
+## Asymptotic Learning Rate Based on Resistance Condition
+df_2x2_complete <- df %>% 
+  pivot_wider(id_cols = 'id', names_from = c('group','task.resistance'),values_from='alpha.inf') %>%
+  as.data.frame %$%
+  data_2x2(array_1 = .$`HC_No Resistance`,
+                               array_2 = .$`iMUD_No Resistance`,
+                               array_3 = .$`HC_Resistance`,
+                               array_4 = .$iMUD_Resistance,
+                               labels = (c('No Resistance','Resistance')),jit_distance = .09,jit_seed = 321,spread_x_ticks = F)
+my.raincloud(data = df_2x2_complete, size = 2,alpha = .65) + 
+  scale_x_continuous(breaks=c(1,2), labels=c("No Resistance", "Resistance"), limits=c(0, 3))  + 
+  xlab("Resistance Condition") + theme_classic()+guides(color = "none", fill = "none")
+
+
+## Information Bonus Based on Horizon
+modified_df <- df %>%
+  mutate(id = paste(id, ifelse(task.resistance == "No Resistance", "_no_resistance", "_resistance"), sep = "")) %>%
+  select(id, group, info.bonus.h1, info.bonus.h6) %>%
+  pivot_longer(
+    cols = c(info.bonus.h1, info.bonus.h6),
+    names_to = "horizon",
+    values_to = "info.bonus",
+    names_prefix = "info.bonus."
+  )
+
+df_2x2_complete <- modified_df %>% 
+  pivot_wider(id_cols = 'id', names_from = c('group','horizon'),values_from='info.bonus') %>%
+  as.data.frame %$%
+  data_2x2(array_1 = .$`HC_h1`,
+                               array_2 = .$`iMUD_h1`,
+                               array_3 = .$`HC_h6`,
+                               array_4 = .$iMUD_h6,
+                               labels = (c('H1','H6')),jit_distance = .09,jit_seed = 321,spread_x_ticks = F)
+my.raincloud(data = df_2x2_complete, size = 1,alpha = .65) + 
+  scale_x_continuous(breaks=c(1,2), labels=c("H1", "H6"), limits=c(0, 3))  + 
+  xlab("Horizon") + theme_classic()+guides(color = "none", fill = "none")
+
+
+## Decision Noise Based on Horizon
+modified_df <- df %>%
+  mutate(id = paste(id, ifelse(task.resistance == "No Resistance", "_no_resistance", "_resistance"), sep = "")) %>%
+  select(id, group, dec.noise.h1.22, dec.noise.h6.22) %>%
+  pivot_longer(
+    cols = c(dec.noise.h1.22, dec.noise.h6.22),
+    names_to = "horizon",
+    values_to = "dec.noise",
+    names_prefix = "dec.noise."
+  )
+
+df_2x2_complete <- modified_df %>% 
+  pivot_wider(id_cols = 'id', names_from = c('group','horizon'),values_from='dec.noise') %>%
+  as.data.frame %$%
+  data_2x2(array_1 = .$`HC_h1`,
+                               array_2 = .$`iMUD_h1`,
+                               array_3 = .$`HC_h6`,
+                               array_4 = .$iMUD_h6,
+                               labels = (c('H1','H6')),jit_distance = .09,jit_seed = 321,spread_x_ticks = F)
+my.raincloud(data = df_2x2_complete, size = 1,alpha = .65) + 
+  scale_x_continuous(breaks=c(1,2), labels=c("H1", "H6"), limits=c(0, 3))  + 
+  xlab("Horizon") + theme_classic()+guides(color = "none", fill = "none")
+
+
+
+
+
+```
+
+```{r Create Plot for Accuracy}
+group.colors = c("#2E86C1", "#2ECC71") 
+
+std.error <- function(x) {
+  sd(x) / sqrt(length(x))
+}
+
+my.raincloud <- function(data_2x2,
+                                 colors = (c('#2E86C1', '#2ECC71', '#2E86C1', '#2ECC71')),
+                                 fills = (c('#2E86C1', '#2ECC71', '#2E86C1', '#2ECC71')),
+                                 line_color = 'gray',
+                                 line_alpha = .3,
+                                 size = 1.5,
+                                 alpha = .6) {
+
+  sum <- data_2x2 %>% dplyr::rename(res='group') %>%
+    group_by(res, x_axis) %>%
+    dplyr::summarize(mean=mean(y_axis), se=std.error(y_axis)) %>%
+    as.data.frame %>% mutate(upper=mean+se) %>% mutate(lower=mean-se) %>%
+    suppressMessages()
+  
+  figure_2x2 <- ggplot(data = data_2x2) +
+    
+    #Add geom_() objects
+    geom_point(data = data_2x2 %>% dplyr::filter(x_axis =="1"), aes(x = jit, y = y_axis), color = colors[1], fill = fills[1], size = size,
+               alpha = .75) +
+    geom_point(data = data_2x2 %>% dplyr::filter(x_axis =="1.01"), aes(x = jit, y = y_axis), color = colors[2], fill = fills[2], size = size,
+               alpha = .75) +
+    geom_point(data = data_2x2 %>% dplyr::filter(x_axis =="2"), aes(x = jit, y = y_axis), color = colors[3], fill = fills[3], size = size,
+               alpha = .75) +
+    geom_point(data = data_2x2 %>% dplyr::filter(x_axis =="2.01"), aes(x = jit, y = y_axis), color = colors[4], fill = fills[4], size = size,
+               alpha = .75) +
+    
+    geom_line(data = data_2x2, aes(x=jit, y = y_axis, group=id), inherit.aes = F, alpha=.2) +
+    geom_line(data = data_2x2 %>% dplyr::filter(x_axis %in% c("1", "2")), aes(x = jit, y = y_axis, group = id), color = colors[1], alpha = .2) +
+    geom_line(data = data_2x2 %>% dplyr::filter(x_axis %in% c("1.01", "2.01")), aes(x = jit, y = y_axis, group = id), color = colors[2], alpha = .2) +
+    
+    #geom_line(data = sum, aes(x = x_axis, y = mean, color = res, group = res), linewidth = 1) +
+    geom_ribbon(data = sum, aes(x = x_axis, ymin = upper, ymax = lower, group = res, fill = res), alpha=.8,
+                inherit.aes = F, colour = NA)+
+    # Update this line to make the mean lines black and thinner
+    geom_line(data = sum, aes(x = x_axis, y = mean, group = res), color = 'black', linewidth = 0.7) +
+
+    scale_color_manual(values = c('#2E86C1', '#2ECC71')) +
+    scale_fill_manual(values = c('#2E86C1', '#2ECC71')) +
+ 
+    geom_half_violin(
+      data = data_2x2 %>% dplyr::filter(x_axis=="1"),aes(x = x_axis, y = y_axis), color = colors[1], fill = fills[1], position = position_nudge(x = -.35),
+      side = "l", alpha = alpha) +
+    
+    
+    geom_half_violin(
+      data = data_2x2 %>% dplyr::filter(x_axis=="1.01"),aes(x = x_axis, y = y_axis), color = colors[2], fill = fills[2], position = position_nudge(x = -.36),
+      side = "l", alpha = alpha) +
+    
+    
+    geom_half_violin(
+      data = data_2x2 %>% dplyr::filter(x_axis=="2"),aes(x = x_axis, y = y_axis), color = colors[3], fill = fills[3], position = position_nudge(x = .35),
+      side = "r", alpha = alpha) +
+
+    
+    geom_half_violin(
+      data = data_2x2 %>% dplyr::filter(x_axis=="2.01"),aes(x = x_axis, y = y_axis), color = colors[4], fill = fills[4], position = position_nudge(x = .34),
+      side = "r", alpha = alpha) 
+  
+  return(figure_2x2)
+  
+  
+}
+
+
+
+
+
+### H1 Accuracy
+
+## Equal
+df_2x2_complete <- df %>% 
+  pivot_wider(id_cols = 'id', names_from = c('group','task.resistance'),values_from='h1.equal.1') %>%
+  as.data.frame %$%
+  data_2x2(array_1 = .$`HC_No Resistance`,
+                               array_2 = .$`iMUD_No Resistance`,
+                               array_3 = .$`HC_Resistance`,
+                               array_4 = .$`iMUD_Resistance`,
+                               labels = (c('No Resistance','Resistance')),jit_distance = .09,jit_seed = 321,spread_x_ticks = F)
+my.raincloud(data = df_2x2_complete, size = 2,alpha = .65) + 
+  scale_x_continuous(breaks=c(1,2), labels=c("No Resistance", "Resistance"), limits=c(0, 3))  + 
+  xlab("Resistance Condition") + theme_classic()+guides(color = "none", fill = "none")
+
+
+## Unequal
+df_2x2_complete <- df %>% 
+  pivot_wider(id_cols = 'id', names_from = c('group','task.resistance'),values_from='h1.unequal.1') %>%
+  as.data.frame %$%
+  data_2x2(array_1 = .$`HC_No Resistance`,
+                               array_2 = .$`iMUD_No Resistance`,
+                               array_3 = .$`HC_Resistance`,
+                               array_4 = .$`iMUD_Resistance`,
+                               labels = (c('No Resistance','Resistance')),jit_distance = .09,jit_seed = 321,spread_x_ticks = F)
+my.raincloud(data = df_2x2_complete, size = 2,alpha = .65) + 
+  scale_x_continuous(breaks=c(1,2), labels=c("No Resistance", "Resistance"), limits=c(0, 3))  + 
+  xlab("Resistance Condition") + theme_classic()+guides(color = "none", fill = "none")
+
+
+
+
+
+
+### H6 Accuracy for Equal and Unequal
+
+df$h6_equal_accuracy = rowMeans(df[, c(
+  "h6.equal.1", 
+  "h6.equal.2", 
+  "h6.equal.3", 
+  "h6.equal.4", 
+  "h6.equal.5",
+  "h6.equal.6"
+)]) 
+
+df$h6_unequal_accuracy = rowMeans(df[, c(
+  "h6.unequal.1", 
+  "h6.unequal.2", 
+  "h6.unequal.3", 
+  "h6.unequal.4", 
+  "h6.unequal.5",
+  "h6.unequal.6"
+)]) 
+
+
+
+
+## Equal
+df_2x2_complete <- df %>% 
+  pivot_wider(id_cols = 'id', names_from = c('group','task.resistance'),values_from='h6_equal_accuracy') %>%
+  as.data.frame %$%
+  data_2x2(array_1 = .$`HC_No Resistance`,
+                               array_2 = .$`iMUD_No Resistance`,
+                               array_3 = .$`HC_Resistance`,
+                               array_4 = .$`iMUD_Resistance`,
+                               labels = (c('No Resistance','Resistance')),jit_distance = .09,jit_seed = 321,spread_x_ticks = F)
+my.raincloud(data = df_2x2_complete, size = 2,alpha = .65) + 
+  scale_x_continuous(breaks=c(1,2), labels=c("No Resistance", "Resistance"), limits=c(0, 3))  + 
+  xlab("Resistance Condition") + theme_classic()+guides(color = "none", fill = "none")
+
+
+## Unequal
+df_2x2_complete <- df %>% 
+  pivot_wider(id_cols = 'id', names_from = c('group','task.resistance'),values_from='h6_unequal_accuracy') %>%
+  as.data.frame %$%
+  data_2x2(array_1 = .$`HC_No Resistance`,
+                               array_2 = .$`iMUD_No Resistance`,
+                               array_3 = .$`HC_Resistance`,
+                               array_4 = .$`iMUD_Resistance`,
+                               labels = (c('No Resistance','Resistance')),jit_distance = .09,jit_seed = 321,spread_x_ticks = F)
+my.raincloud(data = df_2x2_complete, size = 2,alpha = .65) + 
+  scale_x_continuous(breaks=c(1,2), labels=c("No Resistance", "Resistance"), limits=c(0, 3))  + 
+  xlab("Resistance Condition") + theme_classic()+guides(color = "none", fill = "none")
+
+
+
+
+
+
+
+
+```
+
+```{r Unused Barplots}
+
+bar.plot <- function(db=adm.data, x.var, y.var, group.colors=NULL, fill.var=NULL, title=""){
+  p <- db %>% 
+    ggplot(aes(x = !!sym(x.var), y = !!sym(y.var)))
+    #ggplot(aes(interaction(Load, Group), y = !!sym(y.var)))
+
+  # If fill.var is provided, add fill aesthetics
+  if (!is.null(fill.var)) {
+    p <- p + aes(fill = !!sym(fill.var))
+  }
+
+  p <- p + 
+    geom_bar(fun = mean, stat = 'summary', alpha = 1, position = position_dodge(), color="black") +
+    stat_summary(fun.data = mean_se, geom = "errorbar", 
+                 color = "black", size = .7, width = .25, position = position_dodge(.9))
+    
+  p <- p +
+    labs(title = title, y = "", x="") +
+    theme_classic() +
+    theme(plot.title = element_text(hjust = 0.5))
+  
+  # If group.colors is provided, add color scales
+  if (!is.null(group.colors)) {
+    p <- p + 
+      #scale_y_continuous(limits = c(NA, 10)) +
+      scale_fill_manual(values = group.colors) +
+      scale_color_manual(values = group.colors)+
+      theme(axis.text.y = element_text(face = "bold"))+ # Make y-axis numbers bold
+      theme(axis.text.x = element_text(face = "bold")) # Make y-axis numbers bold
+  }
+
+  
+
+  return(p)
+}
+group.colors = c("#2E86C1", "#2ECC71") #you don't have to use these colors obviously
+
+
+bar.plot(df, x.var="task.resistance", y.var="info.bonus.h6.h1.diff", group.colors=group.colors, fill.var="group", title="Directed Exploration")
+bar.plot(df, x.var="task.resistance", y.var="alpha.start", group.colors=group.colors, fill.var="group", title="Starting Learning Rate")
+bar.plot(df, x.var="task.resistance", y.var="alpha.inf", group.colors=group.colors, fill.var="group", title="Final Learning Rate")
+
+
+
+```
+
