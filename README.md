@@ -1,3 +1,19 @@
+# Statistical Analysis
+
+This repository contains the R script and data used for statistical analysis in the manuscript, "Individuals with Methamphetamine Use Disorder Show Reduced Directed Exploration and Learning Rates Independent of an Aversive Interoceptive State Induction"
+
+## File Descriptions
+
+### 1. `horizon_MUD_data.csv`
+This is the data file containing participants' fitted parameter estimates and psychological measurements used in statistical analyses.
+
+### 2. `horizon_MUD_data_dictionary.xlsx`
+This is a dictionary describing each column of horizon_MUD_data.csv.
+
+### 3. `horizon_MUD_code.Rmd`
+This is the R script used to perform statistical analyses.
+
+
 # Behavioral Modeling Pipeline
 
 This repository contains MATLAB scripts for processing behavioral data, merging task results, and fitting computational models for hierarchical analysis. The pipeline supports tasks run under loaded and unloaded conditions and uses Kalman Filter-based modeling.
