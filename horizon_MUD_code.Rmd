@@ -38,7 +38,7 @@ source('L:/rsmith/lab-members/cgoldman/general/corrplotplus_CMG.R') # optional f
 
 
 # Change this file path to where you've saved the data file
-df = read.csv("./horizon_iMUD_data.csv")
+df = read.csv("C:/Users/CGoldman/OneDrive - Laureate Institute for Brain Research/Desktop/Horizon iMUD Manuscripts/Nature Communications Psychology/first_revision_data_and_code/horizon_iMUD_data.csv")
 
 
 ## create cluster for starting learning rate
@@ -81,6 +81,8 @@ df$age.centered = gscale(df$age, center.only = T)
 df$list.sort.fully.corrected.t.score.centered = gscale(df$list.sort.fully.corrected.t.score, center.only = T)
 df$alpha.start.centered = gscale(df$alpha.start, center.only = T)
 
+
+# dict = read_excel("C:/Users/CGoldman/OneDrive - Laureate Institute for Brain Research/Desktop/Horizon iMUD Manuscripts/Nature Communications Psychology/horizon_iMUD_data_dictionary.xlsx")
 
 
 
@@ -349,7 +351,7 @@ summarize_and_refine_model_lm <- function(models) {
       anova$Chisq = NA
      # tidy_summary <- tidy_summary[1:(nrow(tidy_summary) - 2), ]
     }
-    anova$partial_eta_squared =  anova$`Sum Sq` / anova["Residuals","Sum Sq"]
+    anova$partial_eta_squared =  anova$`Sum Sq` / (anova$`Sum Sq` + anova["Residuals","Sum Sq"])
     
     anova = anova[1:(nrow(anova)-1),] # get rid of residuals column
   
@@ -600,9 +602,67 @@ chi_sq_result <- chisq.test(contingency_table)
 total_obs <- sum(contingency_table)
 cohens_w <- sqrt(chi_sq_result$statistic / total_obs)
 
+generate_summary_table <- function(df, param_labels, group_var = "group", resistance_var = "task.resistance") {
+  library(dplyr)
+  
+  # Get all combinations of group and resistance values
+  group_levels <- unique(df[[group_var]])
+  resistance_levels <- unique(df[[resistance_var]])
+  
+  result_list <- list()
+  
+  for (g in group_levels) {
+    for (r in resistance_levels) {
+      subset_df <- df %>% filter(.data[[group_var]] == g, .data[[resistance_var]] == r)
+      
+      summary_stats <- sapply(names(param_labels), function(param) {
+        m <- mean(subset_df[[param]], na.rm = TRUE)
+        s <- sd(subset_df[[param]], na.rm = TRUE)
+        sprintf("Mean=%.3f, SD=%.3f", m, s)
+      })
+      
+      result_list[[paste(g, r, sep = "_")]] <- summary_stats
+    }
+  }
+  
+  summary_df <- as.data.frame(result_list)
+  rownames(summary_df) <- param_labels
+  return(summary_df)
+}
 
 
+model_params <- c(
+  alpha.start = "Starting Learning Rate",
+  alpha.inf = "Asymptotic Learning Rate",
+  info.bonus.h1 = "H1 Information Bonus",
+  info.bonus.h6 = "H6 Information Bonus",
+  info.bonus.h6.h1.diff = "Directed Exploration",
+  dec.noise.h1.22 = "H1 Decision Noise",
+  dec.noise.h6.22 = "H6 Decision Noise",
+  dec.noise.h6.h1.22.diff = "Random Exploration"
+)
 
+params_table = generate_summary_table(df, param_labels = model_params)
+# write.csv(table,"L:/rsmith/lab-members/cgoldman/adm/horizon/horizon_latest_results/params_table.csv")
+
+acc_params <- c(
+  h1.equal.1 = "H1 Equal Information First Free Choice Accuracy",
+  h1.unequal.1 = "H1 Unequal Information First Free Choice Accuracy",
+  h6.equal.1 = "H6 Equal Information First Free Choice Accuracy",
+  h6.unequal.1 = "H6 Unequal Information First Free Choice Accuracy",
+  h6.equal.2 = "H6 Equal Information Second Free Choice Accuracy",
+  h6.unequal.2 = "H6 Unequal Information Second Free Choice Accuracy",
+  h6.equal.3 = "H6 Equal Information Third Free Choice Accuracy",
+  h6.unequal.3 = "H6 Unequal Information Third Free Choice Accuracy",
+  h6.equal.4 = "H6 Equal Information Fourth Free Choice Accuracy",
+  h6.unequal.4 = "H6 Unequal Information Fourth Free Choice Accuracy",
+  h6.equal.5 = "H6 Equal Information Fifth Free Choice Accuracy",
+  h6.unequal.5 = "H6 Unequal Information Fifth Free Choice Accuracy",
+  h6.equal.6 = "H6 Equal Information Sixth Free Choice Accuracy",
+  h6.unequal.6 = "H6 Unequal Information Sixth Free Choice Accuracy")
+
+acc_table = generate_summary_table(df, param_labels = acc_params)
+# write.csv(acc_table,"L:/rsmith/lab-members/cgoldman/adm/horizon/horizon_latest_results/acc_table.csv")
 
 
 
@@ -619,7 +679,8 @@ final_df <- bind_rows(original_df, pre_df)
 final_df$context = as.factor(final_df$context)
 
 model = lmer(HT.self.anxiety.during.task.combined ~ group * context + sex+age.centered+old.horizon.version+list.sort.fully.corrected.t.score.centered+(1|id), data=final_df)
-model_summaries <- summarize_and_refine_model_lme(c(model))
+model_no_wm = lmer(HT.self.anxiety.during.task.combined ~ group * context + sex+age.centered+old.horizon.version+(1|id), data=final_df)
+model_summaries <- summarize_and_refine_model_lme(c(model,model_no_wm))
 
 
 
@@ -630,7 +691,8 @@ pre_df = df %>% filter(task.resistance == "Resistance") %>% mutate(HT.stai.anxie
 final_df <- bind_rows(original_df, pre_df)
 
 model = lmer(HT.stai.anxiety.during.task.combined ~ group * context + sex+age.centered+old.horizon.version+list.sort.fully.corrected.t.score.centered+(1|id), data=final_df)
-model_summaries <- summarize_and_refine_model_lme(c(model))
+model_no_wm = lmer(HT.stai.anxiety.during.task.combined ~ group * context + sex+age.centered+old.horizon.version+(1|id), data=final_df)
+model_summaries <- summarize_and_refine_model_lme(c(model,model_no_wm))
 
 
 
@@ -655,7 +717,8 @@ df_long$resistance_level_centered = gscale(df_long$resistance_level, center.only
 
 
 model <- lmer(value ~ resistance_level_centered * group + sex + age.centered +old.horizon.version+list.sort.fully.corrected.t.score.centered+(1 | id), data = df_long)
-model_summaries <- summarize_and_refine_model_lme(c(model))
+model_no_wm <- lmer(value ~ resistance_level_centered * group + sex + age.centered +old.horizon.version+(1 | id), data = df_long)
+model_summaries <- summarize_and_refine_model_lme(c(model,model_no_wm))
 
 
 
@@ -676,6 +739,7 @@ contrasts(df_long$horizon) <- matrix(c(-1, 1), ncol = 1)
 df_long$info_condition = factor(df_long$info_condition)
 contrasts(df_long$info_condition) <- matrix(c(-1, 1), ncol = 1)
 
+# Model with working memory
 model = lmer(accuracy ~ horizon*group*info_condition + group*horizon*task.resistance+age.centered+sex+old.horizon.version+list.sort.fully.corrected.t.score.centered+(1|id), data=df_long)
 
 model_summaries <- summarize_and_refine_model_lme(c(model))
@@ -690,7 +754,15 @@ F_to_eta2(f=8.76    , df=1, df_error=753)
 F_to_eta2(f=.88    , df=1, df_error=753)
 emmeans(model,pairwise ~ horizon|group)
 
-
+# Model without working memory
+model = lmer(accuracy ~ horizon*group*info_condition + group*horizon*task.resistance+age.centered+sex+old.horizon.version+(1|id), data=df_long)
+Anova(model,test="F")
+summary(model)
+confint(model)
+F_to_eta2(f=137.1037      , df=1, df_error=788)
+F_to_eta2(f=89.3156      , df=1, df_error=788)
+F_to_eta2(f=31.0989      , df=1, df_error=109)
+F_to_eta2(f=8.1373      , df=1, df_error=788)
 
 
 
@@ -1024,6 +1096,16 @@ model_wm = lmer(h6.avg.high.mean.high.info ~ h1.avg.high.mean.high.info + group 
 model_summaries <- summarize_and_refine_model_lme(c(model,model_wm))
 
 
+full_model <- brm(h6.avg.high.mean.high.info ~ h1.avg.high.mean.high.info + group + task.resistance + age.centered+sex+old.horizon.version, data = df, iter=4000, seed = 23, save_pars = save_pars(all = TRUE))
+print(full_model,digits=5)
+no_group_model = brm(h6.avg.high.mean.high.info ~ h1.avg.high.mean.high.info + task.resistance + age.centered+sex+old.horizon.version, data = df, iter=4000, seed = 23, save_pars = save_pars(all = TRUE))
+bayes_factor(full_model, no_group_model)
+
+
+
+
+
+
 # Test for differences in Negative Outcome Avoidance
 df$h6.avg.high.mean.low.info = 1 - df$h6.avg.low.mean.high.info
 df$h1.avg.high.mean.low.info = 1 - df$h1.avg.low.mean.high.info
@@ -1032,7 +1114,10 @@ model = lmer(h6.avg.high.mean.low.info ~ h1.avg.high.mean.low.info + group + tas
 model_wm = lmer(h6.avg.high.mean.low.info ~ h1.avg.high.mean.low.info + group + task.resistance + age.centered+sex+old.horizon.version+list.sort.fully.corrected.t.score.centered+ (1|id), df)
 model_summaries <- summarize_and_refine_model_lme(c(model,model_wm))
 
-
+full_model <- brm(h6.avg.high.mean.low.info ~ h1.avg.high.mean.low.info + group + task.resistance + age.centered+sex+old.horizon.version, data = df, iter=4000, seed = 23, save_pars = save_pars(all = TRUE))
+print(full_model,digits=5)
+no_group_model = brm(h6.avg.high.mean.low.info ~ h1.avg.high.mean.low.info + task.resistance + age.centered+sex+old.horizon.version, data = df, iter=4000, seed = 23, save_pars = save_pars(all = TRUE))
+bayes_factor(full_model, no_group_model)
 
 
  
@@ -1122,6 +1207,9 @@ model11 = lmer(alpha.start ~ task.resistance*DSQ_resid_centered +task.resistance
 model12 <- lmer(alpha.inf ~ task.resistance*DSQ_resid_centered +task.resistance*premock.DSQ.centered + age.centered+sex+alpha.start.centered+list.sort.fully.corrected.t.score.centered+(1|id), data=df_iMUD_no_outliers)
 model_summaries <- summarize_and_refine_model_lme(c(model9,model10,model11,model12))
 
+# interpret marginal interaction effect
+emtrends(model11 = lmer(alpha.start ~ task.resistance*DSQ_resid_centered +task.resistance*premock.DSQ.centered+ age.centered+sex+list.sort.fully.corrected.t.score.centered+(1|id), data=df_iMUD_no_outliers))
+emtrends(model11, specs = ~task.resistance, var = "DSQ_resid_centered")
 
 
 ```
