@@ -1837,6 +1837,8 @@ my.raincloud <- function(data_2x2,
       data = data_2x2 %>% dplyr::filter(x_axis=="2.01"),aes(x = x_axis, y = y_axis), color = colors[4], fill = fills[4], position = position_nudge(x = .34),
       side = "r", alpha = alpha) 
   
+  figure_2x2 <- figure_2x2 + coord_cartesian(ylim = c(0.27, 1)) # ensure the y axis covers an appropriate range
+
   return(figure_2x2)
   
   
@@ -1944,7 +1946,7 @@ my.raincloud(data = df_2x2_complete, size = 2,alpha = .65) +
 
 ```
 
-```{r Post-hoc Power Analysis}
+```{r Power Sensitivity Analysis}
 library(WebPower)
 
 # Assess the ability to identify a between-subjects effect (i.e., group)
